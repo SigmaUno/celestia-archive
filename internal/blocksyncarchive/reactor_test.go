@@ -1081,7 +1081,7 @@ func newStockBlocksyncServingReactor(t *testing.T, blocks ...*types.Block) *cmtb
 		t.Fatal(saveErr)
 	}
 	blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), nil, nil, sm.EmptyEvidencePool{}, blockStore)
-	return cmtblocksync.NewReactor(false, false, state, blockExec, blockStore, nil, 0, cmtblocksync.NopMetrics())
+	return cmtblocksync.NewReactor(state, blockExec, blockStore, false, cmtblocksync.NopMetrics(), 0)
 }
 
 func collectRequests(envelopes []p2p.Envelope) []*bcproto.BlockRequest {
@@ -1221,6 +1221,7 @@ func (p *fakePeer) String() string                  { return string(p.id) }
 func (*fakePeer) SetLogger(log.Logger)              {}
 func (*fakePeer) FlushStop()                        {}
 func (p *fakePeer) ID() p2p.ID                      { return p.id }
+func (p *fakePeer) HasIPChanged() bool              { return false }
 func (*fakePeer) RemoteIP() net.IP                  { return nil }
 func (*fakePeer) RemoteAddr() net.Addr              { return nil }
 func (*fakePeer) IsOutbound() bool                  { return false }

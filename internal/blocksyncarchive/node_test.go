@@ -16,6 +16,7 @@ import (
 	cmtcfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/trace"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/pex"
 	bcproto "github.com/cometbft/cometbft/proto/tendermint/blocksync"
@@ -37,11 +38,11 @@ func TestArchiveNodeMountsOnlyArchiveBlocksyncReactor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := node.Switch.Reactor(ReactorName); !ok {
+	if node.Switch.Reactor(ReactorName) == nil {
 		t.Fatalf("switch missing %s reactor", ReactorName)
 	}
 	for _, absent := range []string{"CONSENSUS", "MEMPOOL", "EVIDENCE", "STATESYNC"} {
-		if _, ok := node.Switch.Reactor(absent); ok {
+		if node.Switch.Reactor(absent) != nil {
 			t.Fatalf("switch unexpectedly mounted %s reactor", absent)
 		}
 	}
@@ -74,14 +75,14 @@ func TestArchiveNodeCanMountPEXWithoutConsensusReactors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := node.Switch.Reactor(ReactorName); !ok {
+	if node.Switch.Reactor(ReactorName) == nil {
 		t.Fatalf("switch missing %s reactor", ReactorName)
 	}
-	if _, ok := node.Switch.Reactor("PEX"); !ok {
+	if node.Switch.Reactor("PEX") == nil {
 		t.Fatal("switch missing PEX reactor")
 	}
 	for _, absent := range []string{"CONSENSUS", "MEMPOOL", "EVIDENCE", "STATESYNC"} {
-		if _, ok := node.Switch.Reactor(absent); ok {
+		if node.Switch.Reactor(absent) != nil {
 			t.Fatalf("switch unexpectedly mounted %s reactor", absent)
 		}
 	}
@@ -1177,7 +1178,7 @@ func newNoBlockP2PNode(t *testing.T, listenAddress string, advertised PeerRange)
 	cfg := cmtcfg.DefaultP2PConfig()
 	cfg.ListenAddress = listenAddress
 	cfg.AllowDuplicateIP = true
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg))
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
 	sw := p2p.NewSwitch(cfg, transport)
 	sw.SetLogger(log.NewNopLogger())
@@ -1212,7 +1213,7 @@ func newSilentBlockP2PNode(t *testing.T, listenAddress string, advertised PeerRa
 	cfg := cmtcfg.DefaultP2PConfig()
 	cfg.ListenAddress = listenAddress
 	cfg.AllowDuplicateIP = true
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg))
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
 	sw := p2p.NewSwitch(cfg, transport)
 	sw.SetLogger(log.NewNopLogger())
@@ -1436,7 +1437,7 @@ func newBlockRequesterP2PNode(t *testing.T, listenAddress string, requestHeight 
 	}
 	cfg := cmtcfg.DefaultP2PConfig()
 	cfg.ListenAddress = listenAddress
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg))
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
 	sw := p2p.NewSwitch(cfg, transport)
 	sw.SetLogger(log.NewNopLogger())
@@ -1549,7 +1550,7 @@ func newStockBlocksyncP2PNode(t *testing.T, listenAddress string, blocks ...*typ
 	}
 	cfg := cmtcfg.DefaultP2PConfig()
 	cfg.ListenAddress = listenAddress
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg))
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
 	sw := p2p.NewSwitch(cfg, transport)
 	logger := log.NewNopLogger()

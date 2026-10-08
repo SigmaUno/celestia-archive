@@ -10,6 +10,7 @@ import (
 	cmtcfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/trace"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/version"
@@ -96,7 +97,7 @@ func NewArchiveNode(ingestor *HotIngestor, planner *RequestPlanner, opts NodeOpt
 	cfg.AddrBookStrict = opts.AddrBookStrict
 	cfg.Seeds = strings.Join(opts.Seeds, ",")
 	cfg.SeedMode = opts.SeedMode
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg))
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
 	if opts.PEX {
 		transport.AddChannel(pex.PexChannel)

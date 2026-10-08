@@ -14,7 +14,7 @@ const testChainID = "archive-test-chain"
 
 func makeTestBlock(t *testing.T, height int64) *ctypes.Block {
 	t.Helper()
-	block := ctypes.MakeBlock(height, []ctypes.Tx{ctypes.Tx(fmt.Sprintf("tx-%d", height))}, &ctypes.Commit{}, nil)
+	block := ctypes.MakeBlock(height, ctypes.Data{Txs: []ctypes.Tx{ctypes.Tx(fmt.Sprintf("tx-%d", height))}}, &ctypes.Commit{}, nil)
 	block.ChainID = testChainID
 	block.ProposerAddress = bytesOf(byte(height), crypto.AddressSize)
 	block.ValidatorsHash = bytesOf(0x11, 32)

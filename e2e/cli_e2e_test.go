@@ -19,6 +19,7 @@ import (
 	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/trace"
 	cmtnode "github.com/cometbft/cometbft/node"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/privval"
@@ -683,7 +684,7 @@ func makeE2EBlock(t *testing.T, height int64) *ctypes.Block {
 	} else {
 		lastCommit = &ctypes.Commit{Height: 0, Signatures: []ctypes.CommitSig{}}
 	}
-	block := ctypes.MakeBlock(height, []ctypes.Tx{ctypes.Tx(fmt.Sprintf("tx-%d", height))}, lastCommit, nil)
+	block := ctypes.MakeBlock(height, ctypes.Data{Txs: []ctypes.Tx{ctypes.Tx(fmt.Sprintf("tx-%d", height))}}, lastCommit, nil)
 	block.ChainID = e2eChainID
 	block.ProposerAddress = e2eBytes(byte(height), crypto.AddressSize)
 	block.ValidatorsHash = e2eBytes(0x11, 32)
@@ -781,7 +782,7 @@ func newE2EBlockRequesterP2PNode(t *testing.T, listenAddress string, requestHeig
 	}
 	cfg := cmtcfg.DefaultP2PConfig()
 	cfg.ListenAddress = listenAddress
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg))
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
 	sw := p2p.NewSwitch(cfg, transport)
 	sw.SetLogger(log.NewNopLogger())
@@ -815,7 +816,7 @@ func newE2EStockBlocksyncP2PNode(t *testing.T, listenAddress string, blocks ...*
 	}
 	cfg := cmtcfg.DefaultP2PConfig()
 	cfg.ListenAddress = listenAddress
-	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg))
+	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
 	sw := p2p.NewSwitch(cfg, transport)
 	logger := log.NewNopLogger()
@@ -866,7 +867,7 @@ func newE2EStockBlocksyncServingReactor(t *testing.T, blocks ...*ctypes.Block) *
 		t.Fatal(saveErr)
 	}
 	blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), nil, nil, sm.EmptyEvidencePool{}, blockStore)
-	return cmtblocksync.NewReactor(false, false, state, blockExec, blockStore, nil, 0, cmtblocksync.NopMetrics())
+	return cmtblocksync.NewReactor(state, blockExec, blockStore, false, cmtblocksync.NopMetrics(), 0)
 }
 
 func (n *e2eStockBlocksyncP2PNode) Start() error {

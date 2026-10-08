@@ -2017,7 +2017,7 @@ func createCLIBlockStoreFixture(t *testing.T, dir string, heights int) {
 }
 
 func makeCLITestBlock(height int64) *ctypes.Block {
-	block := ctypes.MakeBlock(height, []ctypes.Tx{ctypes.Tx(fmt.Sprintf("tx-%d", height))}, &ctypes.Commit{}, nil)
+	block := ctypes.MakeBlock(height, ctypes.Data{Txs: []ctypes.Tx{ctypes.Tx(fmt.Sprintf("tx-%d", height))}}, &ctypes.Commit{}, nil)
 	block.ChainID = cliTestChainID
 	block.ProposerAddress = testAddress(byte(height))
 	block.ValidatorsHash = testBytes(0x11, 32)
