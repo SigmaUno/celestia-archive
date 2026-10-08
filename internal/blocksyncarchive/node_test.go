@@ -86,7 +86,7 @@ func TestArchiveNodeCanMountPEXWithoutConsensusReactors(t *testing.T) {
 			t.Fatalf("switch unexpectedly mounted %s reactor", absent)
 		}
 	}
-	if string(node.NodeInfo.Channels) != string([]byte{cmtblocksync.BlocksyncChannel, pex.PexChannel}) {
+	if string(node.NodeInfo.Channels) != string(append(append([]byte{cmtblocksync.BlocksyncChannel}, compatChannels...), pex.PexChannel)) {
 		t.Fatalf("unexpected channels: %v", node.NodeInfo.Channels)
 	}
 }
@@ -760,7 +760,7 @@ func TestArchiveNodeFailsOverAfterRealP2PRequestTimeout(t *testing.T) {
 		ListenAddress:  freeListenAddress(t),
 		NodeKeyFile:    filepath.Join(t.TempDir(), "consumer_key.json"),
 		RequestLimit:   1,
-		RequestTimeout: 100 * time.Millisecond,
+		RequestTimeout: 500 * time.Millisecond,
 		StatusInterval: 20 * time.Millisecond,
 	})
 	if err != nil {

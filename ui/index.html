@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cometbft-archive</title>
+<style>
+  body { font: 14px system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  progress { width: 100%; height: 1.5rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  td { border-bottom: 1px solid #ddd; padding: .3rem .5rem; }
+  td:first-child { color: #666; width: 50%; }
+  .bad { color: #c00; } .ok { color: #080; }
+</style>
+<h2>cometbft-archive <small id="ready"></small></h2>
+<progress id="bar" max="1" value="0"></progress>
+<p id="sync"></p>
+<h3>Connect</h3><table id="conn"></table>
+<h3>Storage</h3><table id="storage"></table>
+<h3>Served to peers</h3><table id="served"></table>
+<h3>Network</h3><table id="net"></table>
+<script>
+const $ = id => document.getElementById(id);
+const n = v => Number(v ?? 0).toLocaleString();
+const ago = ns => ns ? `${Math.round((Date.now() - ns / 1e6) / 1000)}s ago` : "never";
+const rows = (el, data) => $(el).innerHTML = data.map(([k, v]) => `<tr><td>${k}<td>${v}`).join("");
+let prev, prevServed;
+
+async function tick() {
+  try {
+    const m = await (await fetch("metrics")).json();
+    $("ready").textContent = (await fetch("readyz")).ok ? "● ready" : "● not ready";
+    $("ready").className = $("ready").textContent.includes("not") ? "bad" : "ok";
+
+    const head = m.peer_best_height, next = m.next_height;
+    $("bar").value = head ? Math.min(1, next / head) : 0;
+    const now = Date.now();
+    const rate = prev ? (next - prev.next) / ((now - prev.t) / 1000) : 0;
+    prev = { next, t: now };
+    const eta = rate > 0 ? `, ETA ${Math.round((head - next) / rate / 60)} min` : "";
+    $("sync").textContent = `${n(next)} / ${n(head)} (${(100 * next / (head || 1)).toFixed(2)}%) · ${rate.toFixed(1)} blk/s${eta}`;
+
+    const port = (m.p2p_listen || "").split(":").pop();
+    rows("conn", [
+      ["Chain ID", m.chain_id],
+      ["Node ID", `<code>${m.node_id}</code>`],
+      ["Moniker", m.moniker],
+      ["P2P address", `<code>${m.node_id}@${location.hostname}:${port}</code>`],
+      ["Validation", m.validation],
+      ["Segment blocks / compression", `${m.segment_blocks} / ${m.compression}`],
+      ["Safety window / retain blocks", `${n(m.safety_window)} / ${n(m.retain_blocks)}`],
+    ]);
+    const served = (m.blocksync_hot_responses ?? 0) + (m.blocksync_cold_responses ?? 0);
+    const servedRate = prevServed ? (served - prevServed.v) / ((now - prevServed.t) / 1000) : 0;
+    prevServed = { v: served, t: now };
+    rows("served", [
+      ["Blocks served (total)", `<b>${n(served)}</b> · ${servedRate.toFixed(1)} blk/s`],
+      ["From hot store", n(m.blocksync_hot_responses)],
+      ["From S3 archive (cold)", n(m.blocksync_cold_responses)],
+      ["Requests with no block", n(m.blocksync_no_block_responses)],
+      ["Cold errors", n(m.blocksync_cold_errors)],
+    ]);
+    const err = m.last_archive_error ? `<span class=bad>${m.last_archive_error}</span>` : "none";
+    rows("storage", [
+      ["Blocks archived to S3", n(m.blocks_archived)],
+      ["Archive runs / errors", `${n(m.archive_runs)} / ${n(m.archive_errors)}`],
+      ["Last archive success", ago(m.last_archive_success_unix_nano)],
+      ["Last archive error", err],
+      ["Hot range", `${n(m.hot_base)} – ${n(m.hot_height)}`],
+      ["Blocks pruned", n(m.blocks_pruned)],
+    ]);
+    rows("net", [
+      ["Peers", n(m.p2p_peers)],
+      ["Served range", `${n(m.served_base)} – ${n(m.served_height)}`],
+      ["In-flight / buffered", `${n(m.blocksync_inflight_requests)} / ${n(m.blocksync_buffered_responses)}`],
+      ["Request timeouts", n(m.blocksync_request_timeouts)],
+    ]);
+  } catch (e) {
+    $("ready").textContent = "● unreachable";
+    $("ready").className = "bad";
+  }
+}
+tick(); setInterval(tick, 3000);
+</script>

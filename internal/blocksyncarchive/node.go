@@ -33,6 +33,7 @@ type NodeOptions struct {
 	SeedMode        bool
 	PrivatePeerIDs  []string
 	ColdBlockSource ColdBlockSource
+	Logger          log.Logger
 }
 
 type ArchiveNode struct {
@@ -42,6 +43,8 @@ type ArchiveNode struct {
 	Transport *p2p.MultiplexTransport
 	Switch    *p2p.Switch
 	Reactor   *Reactor
+
+	persistentPeers []string
 }
 
 func NewArchiveNode(ingestor *HotIngestor, planner *RequestPlanner, opts NodeOptions) (*ArchiveNode, error) {
@@ -74,7 +77,7 @@ func NewArchiveNode(ingestor *HotIngestor, planner *RequestPlanner, opts NodeOpt
 	if err != nil {
 		return nil, err
 	}
-	channels := []byte{cmtblocksync.BlocksyncChannel}
+	channels := append([]byte{cmtblocksync.BlocksyncChannel}, compatChannels...)
 	if opts.PEX {
 		channels = append(channels, pex.PexChannel)
 	}
@@ -99,13 +102,21 @@ func NewArchiveNode(ingestor *HotIngestor, planner *RequestPlanner, opts NodeOpt
 	cfg.SeedMode = opts.SeedMode
 	transport := p2p.NewMultiplexTransport(nodeInfo, *nodeKey, p2p.MConnConfig(cfg), trace.NoOpTracer())
 	transport.AddChannel(cmtblocksync.BlocksyncChannel)
+	for _, ch := range compatChannels {
+		transport.AddChannel(ch)
+	}
 	if opts.PEX {
 		transport.AddChannel(pex.PexChannel)
 	}
 	sw := p2p.NewSwitch(cfg, transport)
-	logger := log.NewNopLogger()
-	sw.SetLogger(logger)
+	logger := opts.Logger
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+	sw.SetLogger(logger.With("module", "p2p"))
+	reactor.SetLogger(logger.With("module", "blocksync"))
 	sw.AddReactor(ReactorName, reactor)
+	sw.AddReactor(compatReactorName, newCompatReactor())
 	if opts.PEX {
 		addrBook := pex.NewAddrBook(opts.AddrBookFile, opts.AddrBookStrict)
 		addrBook.SetLogger(logger.With("module", "addrbook"))
@@ -137,6 +148,8 @@ func NewArchiveNode(ingestor *HotIngestor, planner *RequestPlanner, opts NodeOpt
 		Transport: transport,
 		Switch:    sw,
 		Reactor:   reactor,
+
+		persistentPeers: opts.PersistentPeers,
 	}, nil
 }
 
@@ -151,6 +164,9 @@ func (n *ArchiveNode) Start() error {
 	if err := n.Switch.Start(); err != nil {
 		_ = n.Transport.Close()
 		return err
+	}
+	if len(n.persistentPeers) > 0 {
+		return n.Switch.DialPeersAsync(n.persistentPeers)
 	}
 	return nil
 }

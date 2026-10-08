@@ -1,0 +1,69 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_ADDRESS: :9000
+      RUSTFS_CONSOLE_ENABLE: 'true'
+      RUSTFS_VOLUMES: /data
+    ports:
+    - 9000:9000
+    - 9001:9001
+    volumes:
+    - rustfs-data:/data
+  create-bucket:
+    image: amazon/aws-cli:latest
+    depends_on:
+    - rustfs
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_REGION: us-east-1
+    entrypoint:
+    - /bin/sh
+    - -c
+    command:
+    - 'until aws --endpoint-url http://rustfs:9000 s3 mb s3://archive 2>&1 | grep
+      -qE ''make_bucket|BucketAlreadyOwnedByYou''; do sleep 2; done
+
+      '
+    restart: 'no'
+  archive:
+    build: .
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_REGION: us-east-1
+    command:
+    - serve
+    - --dry-run=false
+    - --store=s3://archive?region=us-east-1&endpoint=http%3A%2F%2Frustfs%3A9000&path_style=true
+    - --chain-id=${CHAIN_ID:-mocha-5}
+    - --persistent-peers=${PERSISTENT_PEERS:-586647d3709b52bd6eda9f2ceda668d6de7e27c1@134.119.217.185:26656,f4db13a3af43571edcbc8c2a8b702138d770cba3@173.201.36.182:26656,8a3f79a26ac786061c473de399f52083124db91e@111.68.0.234:46656,43e9da043318a4ea0141259c17fcb06ecff816af@49.12.92.82:43656,a11c478a3128f9d49c80ec57d5afe4256e9ef471@173.208.48.222:11656,1bbca8f6a7405e829563852ae250a01a443b52be@135.181.21.165:26656,ddf2761a46f91955c129f8f28f41d7084490e805@145.239.232.71:10256,2d60a06a96bdfa43bc6b9cd980f89cbbc9aeb6c3@62.210.93.176:26656,ed8359cd707c622b0a9250824e311ee1fdb65ba0@195.154.103.76:26656,b3a728c618174cf227004489a14521721ef5841a@62.210.93.173:26656,9bfbae02061b2df66bd411c9a953b898e9167425@149.50.116.126:61656,89487bc081cad4b073b33cecb5db72b3654e1681@195.154.218.203:26656,a067d3f26afdd0a214df5f8d055c5495fe61810d@136.243.94.113:26656,4faaa926a8575c45c54f1f5968bd75b81533f016@46.166.174.131:26656,b402fe40f3474e9e208840702e1b7aa37f2edc4b@65.109.69.119:14656,5b1250b426e5ea12a129f7b8f480d67ef2c40455@102.203.82.2:46656,dbd78d7c61f1789814685d5ed37fb39ff054177d@135.181.227.236:39656,ab86412e6c362738b203e6a21be92206e2fa275d@84.32.176.121:26656,41115ce4008ef08e63ea7e2538b01124919620ee@37.27.231.238:44656,a4e394e11c931c6d1eded9d918486dc25efb9d41@64.130.45.60:26656,27844600b6936270e7ba747e714a0799a2248398@31.7.196.17:26656,3c8ceed02c50b2c6b77333f1265e3fc2c13d269b@167.235.178.134:11656,3a26b59d548d41092c11883f596514eb428f50ae@45.250.252.65:27656,1be6ef888455151f091e9e9894b656b9720a708e@85.195.79.254:25656,0b6bb5c485d071cc1b9f826edf89e4726849f139@195.154.212.42:26656,f1c907cec503100f9a0692de30ac04349606bc67@45.113.226.208:36656,5de6dcfb9ab6c4d8882596b2ad42cef2b67afc76@139.84.244.61:26656,2f056b3ed189b1afa090794332dd29a4839df983@154.45.250.85:26656,c691844a9213083f324fa5f851b71d4091e0d918@64.130.45.52:26656,ea9994ae9cd191cff268a885580cd58562000c41@203.209.219.89:656}
+    - --db-dir=/data/db
+    - --node-key-file=/data/node_key.json
+    - --metrics-listen=0.0.0.0:26660
+    - --safety-window=${SAFETY_WINDOW:-100}
+    - --archive-interval=10s
+    - --prune-interval=0
+    ports:
+    - 26656:26656
+    - 26660:26660
+    volumes:
+    - archive-data:/data
+  ui:
+    image: nginx:alpine
+    depends_on:
+    - archive
+    ports:
+    - 8080:80
+    volumes:
+    - ./ui/index.html:/usr/share/nginx/html/index.html:ro
+    - ./ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+volumes:
+  rustfs-data: null
+  archive-data: null

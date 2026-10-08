@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	cmtflags "github.com/cometbft/cometbft/libs/cli/flags"
+	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	cmtstore "github.com/cometbft/cometbft/store"
 	"github.com/spf13/cobra"
@@ -469,7 +471,7 @@ func newServeCommand() (*cobra.Command, error) {
 	var flags commonFlags
 	var dbDir, backend, listenAddress, moniker, nodeKeyFile, persistentPeers, compression string
 	var addrBookFile, seeds, privatePeerIDs string
-	var metricsListen string
+	var metricsListen, logLevel string
 	var configPath string
 	var validationMode, validatorSetRPC string
 	var checkpointValues, validatorSetValues []string
@@ -621,6 +623,10 @@ func newServeCommand() (*cobra.Command, error) {
 				if ttlErr := coldSource.SetManifestCacheTTL(coldManifestCacheTTL); ttlErr != nil {
 					return ttlErr
 				}
+				nodeLogger, err := cmtflags.ParseLogLevel(logLevel, cmtlog.NewTMLogger(cmtlog.NewSyncWriter(cmd.ErrOrStderr())), "info")
+				if err != nil {
+					return fmt.Errorf("log-level: %w", err)
+				}
 				node, err := blocksyncarchive.NewArchiveNode(ingestor, nil, blocksyncarchive.NodeOptions{
 					ChainID:         flags.chainID,
 					ListenAddress:   listenAddress,
@@ -638,6 +644,7 @@ func newServeCommand() (*cobra.Command, error) {
 					SeedMode:        seedMode,
 					PrivatePeerIDs:  splitCSV(privatePeerIDs),
 					ColdBlockSource: coldSource,
+					Logger:          nodeLogger,
 				})
 				if err != nil {
 					return err
@@ -675,6 +682,15 @@ func newServeCommand() (*cobra.Command, error) {
 						"served_height":                served.Height,
 						liveMetricNextHeight:           ingestor.NextHeight(),
 						"pending_height":               ingestor.PendingHeight(),
+						"node_id":                      string(node.NodeKey.ID()),
+						"chain_id":                     flags.chainID,
+						"moniker":                      moniker,
+						"p2p_listen":                   listenAddress,
+						"validation":                   validationMode,
+						"segment_blocks":               segmentBlocks,
+						"compression":                  compression,
+						"safety_window":                safetyWindow,
+						"retain_blocks":                retainBlocks,
 					}
 				})
 				if metricsErr != nil {
@@ -792,6 +808,7 @@ func newServeCommand() (*cobra.Command, error) {
 	cmd.Flags().StringVar(&seeds, "seeds", "", "Comma-delimited seed node addresses for PEX")
 	cmd.Flags().BoolVar(&seedMode, "seed-mode", false, "Run PEX in seed/crawler mode")
 	cmd.Flags().StringVar(&privatePeerIDs, "private-peer-ids", "", "Comma-delimited peer IDs that PEX must not add")
+	cmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level, or module:level pairs such as p2p:debug,*:info (modules: p2p, blocksync)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "Optional TCP listen address for /healthz and /metrics")
 	cmd.Flags().Int64Var(&safetyWindow, "safety-window", 100, "Number of hot blocks to keep ahead of archive uploads")
 	cmd.Flags().DurationVar(&archiveInterval, "archive-interval", 30*time.Second, "Interval for archiving safety-windowed hot blocks while serving")

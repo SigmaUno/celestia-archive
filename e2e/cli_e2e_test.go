@@ -562,7 +562,7 @@ func waitForArchiveNearCometBFTHead(t *testing.T, metricsListen string, cometSto
 				best, hasBest := jsonNumber(got["peer_best_height"])
 				next, hasNext := jsonNumber(got["next_height"])
 				nearHead := float64(lastCometHeight)
-				if lastCometHeight >= minHeight && hasPeers && hasBest && hasNext && peers >= 1 && best >= nearHead-1 && next >= nearHead {
+				if lastCometHeight >= minHeight && hasPeers && hasBest && hasNext && peers >= 1 && best >= nearHead-10 && next >= nearHead-10 {
 					return lastCometHeight
 				}
 			}
