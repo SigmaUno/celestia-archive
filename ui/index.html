@@ -1,81 +1,207 @@
 <!doctype html>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cometbft-archive</title>
 <style>
-  body { font: 14px system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
-  progress { width: 100%; height: 1.5rem; }
-  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-  td { border-bottom: 1px solid #ddd; padding: .3rem .5rem; }
-  td:first-child { color: #666; width: 50%; }
-  .bad { color: #c00; } .ok { color: #080; }
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #1b1f24; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #7b2bf9; --ok: #15803d; --ok-bg: #dcfce7; --bad: #b91c1c; --bad-bg: #fee2e2;
+    --warn: #a16207; --warn-bg: #fef9c3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #171a21; --fg: #e6e8eb; --muted: #8b93a1; --line: #262b35;
+      --accent: #a678ff; --ok: #4ade80; --ok-bg: #12301f; --bad: #f87171; --bad-bg: #3a1616;
+      --warn: #facc15; --warn-bg: #352d0b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  h1 small { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 6px; }
+  .spacer { flex: 1; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); }
+  .pill.bad { color: var(--bad); background: var(--bad-bg); }
+  .pill.warn { color: var(--warn); background: var(--warn-bg); }
+  .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  button { font: inherit; font-size: 12px; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .hero { margin-bottom: 16px; }
+  .bar { height: 10px; background: var(--line); border-radius: 999px; overflow: hidden; margin: 6px 0 14px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .6s ease; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: 12px; }
+  .stat .label { color: var(--muted); font-size: 12px; }
+  .stat .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  .spark { margin-top: 14px; }
+  .spark svg { width: 100%; height: 48px; display: block; }
+  .spark .meta { display: flex; justify-content: space-between; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 16px; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 6px 0; border-top: 1px solid var(--line); vertical-align: top; font-variant-numeric: tabular-nums; }
+  tr:first-child td { border-top: 0; }
+  td:first-child { color: var(--muted); width: 48%; padding-right: 12px; }
+  td:last-child { text-align: right; overflow-wrap: anywhere; }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .copy { cursor: pointer; border-bottom: 1px dashed var(--muted); }
+  .bad { color: var(--bad); } .ok { color: var(--ok); }
 </style>
-<h2>cometbft-archive <small id="ready"></small></h2>
-<progress id="bar" max="1" value="0"></progress>
-<p id="sync"></p>
-<h3>Connect</h3><table id="conn"></table>
-<h3>Storage</h3><table id="storage"></table>
-<h3>Served to peers</h3><table id="served"></table>
-<h3>Network</h3><table id="net"></table>
+<main>
+  <header>
+    <h1>cometbft-archive <small id="chain"></small></h1>
+    <span id="ready" class="pill warn">connecting</span>
+    <span class="spacer"></span>
+    <span id="updated" class="meta"></span>
+    <button id="pause" type="button">Pause</button>
+  </header>
+
+  <section class="card hero">
+    <h2>Sync</h2>
+    <div class="bar"><div id="bar"></div></div>
+    <div class="stats">
+      <div class="stat"><div class="label">Local height</div><div class="value" id="s-next">–</div></div>
+      <div class="stat"><div class="label">Network head</div><div class="value" id="s-head">–</div></div>
+      <div class="stat"><div class="label">Progress</div><div class="value" id="s-pct">–</div></div>
+      <div class="stat"><div class="label">Speed</div><div class="value" id="s-rate">–</div></div>
+      <div class="stat"><div class="label">ETA</div><div class="value" id="s-eta">–</div></div>
+    </div>
+    <div class="spark">
+      <svg id="spark" viewBox="0 0 300 48" preserveAspectRatio="none" aria-label="Sync speed, last 5 minutes"></svg>
+      <div class="meta"><span>sync speed · last 5 min</span><span id="spark-max"></span></div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="card"><h2>Connect</h2><table id="conn"></table></section>
+    <section class="card"><h2>Storage</h2><table id="storage"></table></section>
+    <section class="card"><h2>Served to peers</h2><table id="served"></table></section>
+    <section class="card"><h2>Network</h2><table id="net"></table></section>
+  </div>
+</main>
 <script>
+const INTERVAL = 3000, HISTORY = 100; // 100 × 3s = 5 min
 const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const n = v => Number(v ?? 0).toLocaleString();
-const ago = ns => ns ? `${Math.round((Date.now() - ns / 1e6) / 1000)}s ago` : "never";
-const rows = (el, data) => $(el).innerHTML = data.map(([k, v]) => `<tr><td>${k}<td>${v}`).join("");
-let prev, prevServed;
+const ago = ns => ns ? dur((Date.now() - ns / 1e6) / 1000) + " ago" : "never";
+const dur = s => {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor(s / 3600) % 24}h`;
+};
+const errCount = v => Number(v ?? 0) > 0 ? `<span class=bad>${n(v)}</span>` : n(v);
+const rows = (el, data) => $(el).innerHTML = data.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+
+let prev, prevServed, rateEma, servedEma, lastOk = 0, paused = false, timer;
+const history = [];
+
+function setReady(text, cls) { $("ready").textContent = text; $("ready").className = `pill ${cls}`; }
+
+function drawSpark() {
+  const svg = $("spark"), max = Math.max(1, ...history);
+  if (history.length < 2) { svg.innerHTML = ""; return; }
+  const step = 300 / (HISTORY - 1), x0 = 300 - (history.length - 1) * step;
+  const pts = history.map((v, i) => `${(x0 + i * step).toFixed(1)},${(46 - (v / max) * 42).toFixed(1)}`);
+  svg.innerHTML =
+    `<polygon points="${x0.toFixed(1)},48 ${pts.join(" ")} 300,48" fill="var(--accent)" opacity=".15"/>` +
+    `<polyline points="${pts.join(" ")}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+  $("spark-max").textContent = `peak ${max.toFixed(1)} blk/s`;
+}
 
 async function tick() {
   try {
-    const m = await (await fetch("metrics")).json();
-    $("ready").textContent = (await fetch("readyz")).ok ? "● ready" : "● not ready";
-    $("ready").className = $("ready").textContent.includes("not") ? "bad" : "ok";
+    const [mr, rr] = await Promise.all([fetch("metrics", { cache: "no-store" }), fetch("readyz", { cache: "no-store" })]);
+    const m = await mr.json();
+    lastOk = Date.now();
+    setReady(rr.ok ? "ready" : "not ready", rr.ok ? "ok" : "warn");
+    $("chain").textContent = m.chain_id ?? "";
 
-    const head = m.peer_best_height, next = m.next_height;
-    $("bar").value = head ? Math.min(1, next / head) : 0;
-    const now = Date.now();
-    const rate = prev ? (next - prev.next) / ((now - prev.t) / 1000) : 0;
+    const head = Number(m.peer_best_height ?? 0), next = Number(m.next_height ?? 0), now = Date.now();
+    const raw = prev ? (next - prev.next) / ((now - prev.t) / 1000) : 0;
     prev = { next, t: now };
-    const eta = rate > 0 ? `, ETA ${Math.round((head - next) / rate / 60)} min` : "";
-    $("sync").textContent = `${n(next)} / ${n(head)} (${(100 * next / (head || 1)).toFixed(2)}%) · ${rate.toFixed(1)} blk/s${eta}`;
+    rateEma = rateEma === undefined ? raw : rateEma * 0.7 + raw * 0.3;
+    history.push(Math.max(0, raw)); if (history.length > HISTORY) history.shift();
+
+    const pct = head ? Math.min(100, (100 * next) / head) : 0;
+    const caughtUp = head > 0 && head - next <= 2;
+    $("bar").style.width = `${pct}%`;
+    $("s-next").textContent = n(next);
+    $("s-head").textContent = n(head);
+    $("s-pct").textContent = `${pct.toFixed(2)}%`;
+    $("s-rate").textContent = `${rateEma.toFixed(1)} blk/s`;
+    $("s-eta").textContent = caughtUp ? "caught up" : rateEma > 0.05 ? dur((head - next) / rateEma) : "–";
+    drawSpark();
 
     const port = (m.p2p_listen || "").split(":").pop();
+    const addr = `${esc(m.node_id)}@${esc(location.hostname)}:${esc(port)}`;
     rows("conn", [
-      ["Chain ID", m.chain_id],
-      ["Node ID", `<code>${m.node_id}</code>`],
-      ["Moniker", m.moniker],
-      ["P2P address", `<code>${m.node_id}@${location.hostname}:${port}</code>`],
-      ["Validation", m.validation],
-      ["Segment blocks / compression", `${m.segment_blocks} / ${m.compression}`],
-      ["Safety window / retain blocks", `${n(m.safety_window)} / ${n(m.retain_blocks)}`],
+      ["Chain ID", esc(m.chain_id)],
+      ["Moniker", esc(m.moniker)],
+      ["P2P address", `<code class=copy title="Click to copy" data-copy="${addr}">${addr}</code>`],
+      ["Validation", esc(m.validation)],
+      ["Segment blocks / compression", `${n(m.segment_blocks)} / ${esc(m.compression)}`],
+      ["Safety window / retain", `${n(m.safety_window)} / ${n(m.retain_blocks)}`],
     ]);
-    const served = (m.blocksync_hot_responses ?? 0) + (m.blocksync_cold_responses ?? 0);
-    const servedRate = prevServed ? (served - prevServed.v) / ((now - prevServed.t) / 1000) : 0;
+
+    const served = Number(m.blocksync_hot_responses ?? 0) + Number(m.blocksync_cold_responses ?? 0);
+    const sraw = prevServed ? (served - prevServed.v) / ((now - prevServed.t) / 1000) : 0;
     prevServed = { v: served, t: now };
+    servedEma = servedEma === undefined ? sraw : servedEma * 0.7 + sraw * 0.3;
     rows("served", [
-      ["Blocks served (total)", `<b>${n(served)}</b> · ${servedRate.toFixed(1)} blk/s`],
+      ["Blocks served", `<b>${n(served)}</b> · ${servedEma.toFixed(1)} blk/s`],
       ["From hot store", n(m.blocksync_hot_responses)],
-      ["From S3 archive (cold)", n(m.blocksync_cold_responses)],
+      ["From archive (cold)", n(m.blocksync_cold_responses)],
       ["Requests with no block", n(m.blocksync_no_block_responses)],
-      ["Cold errors", n(m.blocksync_cold_errors)],
+      ["Cold errors", errCount(m.blocksync_cold_errors)],
     ]);
-    const err = m.last_archive_error ? `<span class=bad>${m.last_archive_error}</span>` : "none";
+
     rows("storage", [
-      ["Blocks archived to S3", n(m.blocks_archived)],
-      ["Archive runs / errors", `${n(m.archive_runs)} / ${n(m.archive_errors)}`],
+      ["Blocks archived", n(m.blocks_archived)],
+      ["Archive runs / errors", `${n(m.archive_runs)} / ${errCount(m.archive_errors)}`],
       ["Last archive success", ago(m.last_archive_success_unix_nano)],
-      ["Last archive error", err],
+      ["Last archive error", m.last_archive_error ? `<span class=bad>${esc(m.last_archive_error)}</span>` : "none"],
       ["Hot range", `${n(m.hot_base)} – ${n(m.hot_height)}`],
       ["Blocks pruned", n(m.blocks_pruned)],
     ]);
+
     rows("net", [
-      ["Peers", n(m.p2p_peers)],
+      ["Peers", Number(m.p2p_peers ?? 0) === 0 ? `<span class=bad>0</span>` : n(m.p2p_peers)],
       ["Served range", `${n(m.served_base)} – ${n(m.served_height)}`],
       ["In-flight / buffered", `${n(m.blocksync_inflight_requests)} / ${n(m.blocksync_buffered_responses)}`],
       ["Request timeouts", n(m.blocksync_request_timeouts)],
     ]);
   } catch (e) {
-    $("ready").textContent = "● unreachable";
-    $("ready").className = "bad";
+    setReady("unreachable", "bad");
   }
 }
-tick(); setInterval(tick, 3000);
+
+function schedule() { clearInterval(timer); if (!paused) { tick(); timer = setInterval(tick, INTERVAL); } }
+
+setInterval(() => {
+  $("updated").textContent = paused ? "paused" : lastOk ? `updated ${dur((Date.now() - lastOk) / 1000)} ago` : "";
+}, 1000);
+
+$("pause").onclick = () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  prev = prevServed = undefined; // avoid a bogus rate spike spanning the pause
+  schedule();
+};
+
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-copy]");
+  if (!t) return;
+  navigator.clipboard?.writeText(t.dataset.copy).then(() => {
+    const old = t.textContent; t.textContent = "copied"; setTimeout(() => t.textContent = old, 900);
+  });
+});
+
+schedule();
 </script>
