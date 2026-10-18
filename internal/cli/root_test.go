@@ -1252,6 +1252,94 @@ func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringArchiveUpload(t *tes
 	}
 }
 
+func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringPruneVerify(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dbDir := filepath.Join(t.TempDir(), "db")
+	createCLIBlockStoreFixture(t, dbDir, 5)
+	reader, err := archive.OpenCometBlockStore(dbDir, "goleveldb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	ingestor, err := blocksyncarchive.NewHotIngestor(reader, blocksyncarchive.IngestOptions{ChainID: cliTestChainID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localStore, err := archive.NewLocalObjectStore(filepath.Join(t.TempDir(), "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived, err := archive.ArchiveReady(ctx, reader, localStore, archive.LiveArchiveOptions{
+		ChainID:       cliTestChainID,
+		Prefix:        "archive",
+		ReadyHeight:   4,
+		SegmentBlocks: 2,
+		Compression:   archive.CompressionGzip,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectStore := &blockingSegmentGetStore{
+		ObjectStore: localStore,
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(objectStore.release)
+		}
+	}()
+	errCh := startLiveIngestorMaintenanceLoop(ctx, ingestor, objectStore, archive.LiveArchiveOptions{
+		ChainID:       cliTestChainID,
+		Prefix:        "archive",
+		SegmentBlocks: 2,
+		Compression:   archive.CompressionGzip,
+	}, 1, time.Hour, archive.PruneHotOptions{
+		ManifestKey:            archived.ManifestKey,
+		RetainBlocks:           1,
+		EvidenceMaxAgeBlocks:   1,
+		EvidenceMaxAgeDuration: time.Nanosecond,
+	}, time.Hour, newLiveMaintenanceStats())
+
+	select {
+	case <-objectStore.started:
+	case loopErr := <-errCh:
+		t.Fatalf("maintenance loop failed before verify read blocked: %v", loopErr)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for prune verification read to block")
+	}
+
+	submitted := make(chan error, 1)
+	go func() {
+		_, submitErr := ingestor.Submit(makeCLITestBlock(6))
+		submitted <- submitErr
+	}()
+	select {
+	case submitErr := <-submitted:
+		if submitErr != nil {
+			t.Fatalf("submit while prune verification blocked: %v", submitErr)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("ingest submit blocked behind object-store prune verification")
+	}
+	close(objectStore.release)
+	released = true
+
+	deadline := time.After(500 * time.Millisecond)
+	for reader.Base() != 5 {
+		select {
+		case loopErr := <-errCh:
+			t.Fatalf("maintenance loop failed after verify released: %v", loopErr)
+		case <-deadline:
+			t.Fatalf("base after prune = %d, want 5", reader.Base())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
 func TestMetricsServerReportsMaintenanceStats(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1995,6 +2083,26 @@ func (s *blockingSegmentStore) blockSegmentPut(ctx context.Context, key string) 
 	case <-s.release:
 	case <-ctx.Done():
 	}
+}
+
+// blockingSegmentGetStore blocks the first segment read until released.
+type blockingSegmentGetStore struct {
+	archive.ObjectStore
+	started chan struct{}
+	release chan struct{}
+	blocked atomic.Bool
+}
+
+func (s *blockingSegmentGetStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if strings.Contains(key, "/segments/") && s.blocked.CompareAndSwap(false, true) {
+		close(s.started)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.ObjectStore.Get(ctx, key)
 }
 
 func createCLIBlockStoreFixture(t *testing.T, dir string, heights int) {

@@ -14,11 +14,16 @@ type VerifyOptions struct {
 	// Concurrency bounds the worker pool used to verify segments in parallel.
 	// Non-positive values select a sensible default (min(GOMAXPROCS, 8)).
 	Concurrency int
+	// FromHeight skips segments that end below this height. Zero or one
+	// verifies every segment in the manifest.
+	FromHeight int64
 }
 
 type VerifyResult struct {
 	SegmentsChecked int
 	BlocksChecked   int
+	// VerifiedThrough is the manifest last height that this run covered.
+	VerifiedThrough int64
 }
 
 func Verify(ctx context.Context, store ObjectStore, opts VerifyOptions) (VerifyResult, error) {
@@ -38,13 +43,19 @@ func Verify(ctx context.Context, store ObjectStore, opts VerifyOptions) (VerifyR
 	if err := ctx.Err(); err != nil {
 		return VerifyResult{}, err
 	}
-	if len(manifest.Segments) == 0 {
-		return VerifyResult{}, nil
+	selected := make([]int, 0, len(manifest.Segments))
+	for i, segment := range manifest.Segments {
+		if segment.LastHeight >= opts.FromHeight {
+			selected = append(selected, i)
+		}
+	}
+	if len(selected) == 0 {
+		return VerifyResult{VerifiedThrough: manifest.LastHeight}, nil
 	}
 
 	workers := segmentConcurrency(opts.Concurrency)
-	if workers > len(manifest.Segments) {
-		workers = len(manifest.Segments)
+	if workers > len(selected) {
+		workers = len(selected)
 	}
 
 	errs := make([]error, len(manifest.Segments))
@@ -76,7 +87,7 @@ func Verify(ctx context.Context, store ObjectStore, opts VerifyOptions) (VerifyR
 		})
 	}
 
-	for i := range manifest.Segments {
+	for _, i := range selected {
 		select {
 		case <-workerCtx.Done():
 			close(jobs)
@@ -97,6 +108,7 @@ func Verify(ctx context.Context, store ObjectStore, opts VerifyOptions) (VerifyR
 	return VerifyResult{
 		SegmentsChecked: int(segmentsChecked),
 		BlocksChecked:   int(blocksChecked),
+		VerifiedThrough: manifest.LastHeight,
 	}, nil
 }
 
