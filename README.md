@@ -55,7 +55,7 @@ queue-full events, next ingest height, and pending block height.
 ## Serve config
 
 `serve --config <file.json>` loads settings from JSON; CLI flags override.
-See [serve.config.example.json](serve.config.example.json) for a full
+See [docs/serve.config.example.json](docs/serve.config.example.json) for a full
 example. `segment_blocks` defaults to `100`, is capped at `1000`, and encoded
 segment payloads are capped at 1 GiB.
 
@@ -79,6 +79,176 @@ s3://bucket/root-prefix?region=us-east-1&endpoint=http%3A%2F%2F127.0.0.1%3A9000&
 
 The S3 backend uses the standard AWS SDK credential chain. Do not point it at
 a real bucket unless you intend to write archive objects there.
+
+Query parameters: `region` (defaults to `us-east-1`), `endpoint` (URL-encoded,
+`http`/`https` only), and `path_style` (defaults to `true` when `endpoint` is
+set). The backend needs `GetObject`, `HeadObject`, `PutObject`, and
+`ListObjectsV2`; it never deletes objects. Segment uploads use
+`PutObject` with `If-None-Match: *`, so the provider must support S3
+conditional writes. A provider that ignores the header loses the
+create-if-absent guarantee; one that rejects it shows up as rising
+`archive_errors`.
+
+## Docker
+
+| File | Purpose |
+| --- | --- |
+| `docker-compose.dev.yml` | Local development: archive peer, status UI, and a throwaway RustFS S3 server. The bucket comes from `BUCKET` (default `archive`), with an optional `STORE_PREFIX`. |
+| `docker-compose.prod.yml` | Production: archive peer and status UI against an external object store. No bundled storage. |
+
+Development:
+
+```text
+docker compose -f docker-compose.dev.yml up --build
+```
+
+The status UI is at <http://localhost:8080>, metrics at
+<http://localhost:26660/metrics>, and the RustFS console at
+<http://localhost:9001> (`rustfsadmin` / `rustfsadmin`).
+
+Production:
+
+```text
+cp .env.example .env    # fill in STORE_URL, PERSISTENT_PEERS, credentials
+docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+```
+
+`STORE_URL` and `PERSISTENT_PEERS` are required. The production stack turns
+on hot-store pruning (`PRUNE_INTERVAL=5m`, `RETAIN_BLOCKS=1000`). Metrics and
+the UI bind to `127.0.0.1` by default; set `UI_BIND=0.0.0.0` only behind a
+reverse proxy or firewall. Only the P2P port (`26656`) is public. Create the
+bucket before the first start; the archiver does not create it.
+
+## Cloud object storage
+
+Every provider below is reached through the `s3://` backend. Set these values
+in `.env` for `docker-compose.prod.yml`, or pass them as `--store` plus the
+`AWS_*` environment variables when running the binary directly.
+
+After the first `ARCHIVE_INTERVAL`, check that `archive_runs` is increasing,
+`archive_errors` is still `0`, and segment objects appear under
+`<prefix>/segments/` in the bucket.
+
+### AWS S3
+
+```dotenv
+STORE_URL=s3://my-archive-bucket/mocha-5?region=eu-west-1
+AWS_REGION=eu-west-1
+# Leave empty to use an EC2 instance profile, ECS task role, or EKS IRSA/Pod Identity.
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+```
+
+Minimal IAM policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-archive-bucket"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::my-archive-bucket/*"
+    }
+  ]
+}
+```
+
+No `endpoint` is needed. S3 supports conditional writes natively. Turn on
+bucket versioning or Object Lock if you want protection against accidental
+overwrites from other tools.
+
+### Google Cloud Storage
+
+GCS is reached through its S3-compatible XML API with HMAC keys:
+
+1. Create a service account and grant it `roles/storage.objectUser` on the
+   bucket.
+2. Create an HMAC key for it (Cloud Storage → Settings → Interoperability, or
+   `gcloud storage hmac create <sa-email>`).
+
+```dotenv
+STORE_URL=s3://my-archive-bucket/mocha-5?region=auto&endpoint=https%3A%2F%2Fstorage.googleapis.com
+AWS_ACCESS_KEY_ID=GOOG1E...        # HMAC access ID
+AWS_SECRET_ACCESS_KEY=...          # HMAC secret
+AWS_REGION=auto
+AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+```
+
+The checksum settings stop the AWS SDK from sending default CRC32 checksums,
+which GCS's XML API rejects. GCS documents its own preconditions
+(`x-goog-if-generation-match`) but does not clearly document
+`If-None-Match: *` on S3-style PUTs. Check the create-if-absent behaviour on a
+scratch bucket before you rely on it. If it doesn't hold, run
+[s3proxy](https://github.com/gaul/s3proxy) with the `google-cloud-storage`
+backend instead; s3proxy performs the conditional PUT natively on GCS.
+
+### Azure Blob Storage
+
+Azure Blob has no S3 API, so the production compose ships an optional
+[s3proxy](https://github.com/gaul/s3proxy) gateway (`azureblob` backend,
+which performs conditional PUTs natively against Azure):
+
+1. Create a storage account and a container, for example
+   `az storage container create --account-name myacct --name cometbft-archive`.
+2. Copy an account key (Storage account → Access keys).
+
+```dotenv
+# Bucket name = container name; s3proxy is reached over the compose network.
+STORE_URL=s3://cometbft-archive/mocha-5?region=us-east-1&endpoint=http%3A%2F%2Fs3proxy%3A80
+AZURE_STORAGE_ACCOUNT=myacct
+AZURE_STORAGE_KEY=...
+# Shared secret between the archiver and s3proxy (any random values).
+AWS_ACCESS_KEY_ID=archive
+AWS_SECRET_ACCESS_KEY=<random-32-bytes>
+```
+
+```text
+docker compose -f docker-compose.prod.yml --env-file .env --profile azure up -d --build
+```
+
+s3proxy is not published on a host port. Pin `S3PROXY_TAG` to a specific
+image digest for production.
+
+### Scaleway Object Storage
+
+1. Create a bucket in the target region (`fr-par`, `nl-ams`, or `pl-waw`).
+2. Create an IAM API key for an application with `ObjectStorageFullAccess`,
+   or a narrower read/write/list policy, scoped to the project.
+
+```dotenv
+STORE_URL=s3://my-archive-bucket/mocha-5?region=fr-par&endpoint=https%3A%2F%2Fs3.fr-par.scw.cloud
+AWS_ACCESS_KEY_ID=SCW...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=fr-par
+```
+
+Scaleway documents support for `If-None-Match` conditional writes.
+
+### DigitalOcean Spaces
+
+1. Create a Space in a datacenter such as `nyc3`, `ams3`, `fra1`, or `sgp1`.
+2. Create a Spaces access key (API → Spaces Keys), limited to that bucket
+   with read/write access.
+
+```dotenv
+STORE_URL=s3://my-archive-space/mocha-5?region=us-east-1&endpoint=https%3A%2F%2Fnyc3.digitaloceanspaces.com
+AWS_ACCESS_KEY_ID=DO...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+```
+
+Spaces expects the SDK region `us-east-1`; the datacenter is chosen by the
+endpoint. Spaces does not clearly document `If-None-Match: *` on PUT, so
+check create-if-absent behaviour on a scratch Space before you rely on it.
 
 ## Development
 
