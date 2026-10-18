@@ -28,28 +28,55 @@ type PruneHotResult struct {
 	EvidenceRetains int64
 }
 
+// PruneVerifiedHotStore verifies the whole archive and then prunes the hot
+// store through the verified height.
 func PruneVerifiedHotStore(ctx context.Context, blockStore *store.BlockStore, objectStore ObjectStore, opts PruneHotOptions) (PruneHotResult, error) {
 	if blockStore == nil {
 		return PruneHotResult{}, errors.New("block store is required")
 	}
-	if opts.ManifestKey == "" {
-		return PruneHotResult{}, errors.New("manifest key is required")
+	if err := validatePruneHotOptions(opts); err != nil {
+		return PruneHotResult{}, err
 	}
-	if opts.RetainBlocks <= 0 {
-		return PruneHotResult{}, errors.New("retain blocks must be positive")
+	verifiedThrough, err := VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, 0)
+	if err != nil {
+		return PruneHotResult{}, err
+	}
+	return PruneHotStoreThrough(blockStore, opts, verifiedThrough)
+}
+
+// VerifyArchiveForPrune verifies archive segments that end at or above
+// fromHeight and returns the manifest height the archive is verified through.
+// It only reads object storage, so callers can run it without exclusive
+// access to the hot store. Pass the previous result plus one to verify only
+// segments archived since the last run.
+func VerifyArchiveForPrune(ctx context.Context, objectStore ObjectStore, manifestKey string, fromHeight int64) (int64, error) {
+	if manifestKey == "" {
+		return 0, errors.New("manifest key is required")
 	}
 	if objectStore == nil {
-		return PruneHotResult{}, errors.New("object store is required")
+		return 0, errors.New("object store is required")
 	}
-	verifyResult, err := Verify(ctx, objectStore, VerifyOptions{ManifestKey: opts.ManifestKey})
+	result, err := Verify(ctx, objectStore, VerifyOptions{ManifestKey: manifestKey, FromHeight: fromHeight})
 	if err != nil {
-		return PruneHotResult{}, fmt.Errorf("verify archive before prune: %w", err)
+		return 0, fmt.Errorf("verify archive before prune: %w", err)
 	}
-	if verifyResult.BlocksChecked == 0 {
-		return PruneHotResult{}, errors.New("archive verification checked no blocks")
+	if fromHeight <= 1 && result.BlocksChecked == 0 {
+		return 0, errors.New("archive verification checked no blocks")
 	}
-	manifest, err := LoadManifest(ctx, objectStore, opts.ManifestKey)
-	if err != nil {
+	if result.VerifiedThrough < fromHeight-1 {
+		return 0, fmt.Errorf("archive manifest last height %d is below previously verified height %d", result.VerifiedThrough, fromHeight-1)
+	}
+	return result.VerifiedThrough, nil
+}
+
+// PruneHotStoreThrough prunes hot blocks at or below archivedThrough while
+// keeping opts.RetainBlocks at the head. archivedThrough must come from
+// VerifyArchiveForPrune; this function performs no object store I/O.
+func PruneHotStoreThrough(blockStore *store.BlockStore, opts PruneHotOptions, archivedThrough int64) (PruneHotResult, error) {
+	if blockStore == nil {
+		return PruneHotResult{}, errors.New("block store is required")
+	}
+	if err := validatePruneHotOptions(opts); err != nil {
 		return PruneHotResult{}, err
 	}
 	base := blockStore.Base()
@@ -58,13 +85,13 @@ func PruneVerifiedHotStore(ctx context.Context, blockStore *store.BlockStore, ob
 		BaseBefore:      base,
 		BaseAfter:       base,
 		Head:            head,
-		ArchivedThrough: manifest.LastHeight,
+		ArchivedThrough: archivedThrough,
 	}
 	if base == 0 || head == 0 {
 		return result, nil
 	}
 	retainPruneTo := head - opts.RetainBlocks + 1
-	archivePruneTo := manifest.LastHeight + 1
+	archivePruneTo := archivedThrough + 1
 	pruneTo := min(retainPruneTo, archivePruneTo)
 	if pruneTo <= base {
 		return result, nil
@@ -85,6 +112,16 @@ func PruneVerifiedHotStore(ctx context.Context, blockStore *store.BlockStore, ob
 	result.EvidenceRetains = evidencePoint
 	result.BaseAfter = blockStore.Base()
 	return result, nil
+}
+
+func validatePruneHotOptions(opts PruneHotOptions) error {
+	if opts.ManifestKey == "" {
+		return errors.New("manifest key is required")
+	}
+	if opts.RetainBlocks <= 0 {
+		return errors.New("retain blocks must be positive")
+	}
+	return nil
 }
 
 func pruneState(blockStore *store.BlockStore, opts PruneHotOptions) (sm.State, error) {

@@ -944,6 +944,9 @@ func startLiveIngestorMaintenanceLoop(
 		archiveInterval = 30 * time.Second
 	}
 	lastPrune := time.Time{}
+	// verifiedThrough lets each prune re-check only segments archived since
+	// the previous successful verification.
+	var verifiedThrough int64
 	runMaintenance := func() bool {
 		archived, archiveErr := archive.ArchiveReadyFromHead(ctx, ingestor.BlockReader(), objectStore, archiveOpts, safetyWindow)
 		if archiveErr != nil {
@@ -957,10 +960,27 @@ func startLiveIngestorMaintenanceLoop(
 		if pruneInterval <= 0 || (!lastPrune.IsZero() && time.Since(lastPrune) < pruneInterval) {
 			return true
 		}
+		// Verify object storage before taking the exclusive hot store lock so
+		// slow remote reads never stall block ingestion.
+		verified, verifyErr := verifyLiveArchive(ctx, objectStore, pruneOpts, verifiedThrough)
+		if verifyErr != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+			verifiedThrough = 0
+			stats.recordPrune(0, verifyErr)
+			return true
+		}
+		verifiedThrough = verified
+		if verified == 0 {
+			stats.recordPrune(0, nil)
+			lastPrune = time.Now()
+			return true
+		}
 		var pruned archive.PruneHotResult
 		pruneErr := ingestor.WithHotStore(func(blockStore *cmtstore.BlockStore) error {
 			var err error
-			pruned, err = runLivePrune(ctx, blockStore, objectStore, pruneOpts)
+			pruned, err = archive.PruneHotStoreThrough(blockStore, pruneOpts, verified)
 			return err
 		})
 		if pruneErr != nil {
@@ -978,23 +998,25 @@ func startLiveIngestorMaintenanceLoop(
 	return errCh
 }
 
-func runLivePrune(
+// verifyLiveArchive verifies segments archived above verifiedThrough and
+// returns the new verified height, or zero when nothing is archived yet.
+func verifyLiveArchive(
 	ctx context.Context,
-	blockStore *cmtstore.BlockStore,
 	objectStore archive.ObjectStore,
 	opts archive.PruneHotOptions,
-) (archive.PruneHotResult, error) {
+	verifiedThrough int64,
+) (int64, error) {
 	manifest, err := archive.LoadManifest(ctx, objectStore, opts.ManifestKey)
 	if errors.Is(err, archive.ErrObjectNotFound) {
-		return archive.PruneHotResult{}, nil
+		return 0, nil
 	}
 	if err != nil {
-		return archive.PruneHotResult{}, err
+		return 0, err
 	}
 	if manifest.LastHeight == 0 {
-		return archive.PruneHotResult{}, nil
+		return 0, nil
 	}
-	return archive.PruneVerifiedHotStore(ctx, blockStore, objectStore, opts)
+	return archive.VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, verifiedThrough+1)
 }
 
 func archiveRange(summary archive.InspectSummary) string {
