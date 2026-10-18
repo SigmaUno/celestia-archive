@@ -1,0 +1,66 @@
+# Production stack: archive peer + status UI against an external object store.
+# Configure via .env (see .env.example); STORE_URL is required.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d
+#
+# For Azure Blob Storage add `--profile azure` to run the s3proxy gateway.
+services:
+  archive:
+    build: .
+    restart: unless-stopped
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_REQUEST_CHECKSUM_CALCULATION: ${AWS_REQUEST_CHECKSUM_CALCULATION:-when_supported}
+      AWS_RESPONSE_CHECKSUM_VALIDATION: ${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_supported}
+    command:
+    - serve
+    - --dry-run=false
+    - --store=${STORE_URL:?set STORE_URL, e.g. s3://bucket/prefix?region=us-east-1}
+    - --chain-id=${CHAIN_ID:-mocha-5}
+    - --persistent-peers=${PERSISTENT_PEERS:?set PERSISTENT_PEERS to a comma-separated id@host:port list}
+    - --db-dir=/data/db
+    - --node-key-file=/data/node_key.json
+    - --metrics-listen=0.0.0.0:26660
+    - --safety-window=${SAFETY_WINDOW:-100}
+    - --archive-interval=${ARCHIVE_INTERVAL:-30s}
+    - --prune-interval=${PRUNE_INTERVAL:-5m}
+    - --retain-blocks=${RETAIN_BLOCKS:-1000}
+    - --log-level=${LOG_LEVEL:-info}
+    ports:
+    - ${P2P_PORT:-26656}:26656
+    # Metrics stay on loopback; the UI proxies them over the compose network.
+    - 127.0.0.1:${METRICS_PORT:-26660}:26660
+    volumes:
+    - archive-data:/data
+  ui:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+    - archive
+    ports:
+    - ${UI_BIND:-127.0.0.1}:${UI_PORT:-8080}:80
+    volumes:
+    - ./ui/index.html:/usr/share/nginx/html/index.html:ro
+    - ./ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+  # S3 -> Azure Blob gateway. Only started with `--profile azure`; point
+  # STORE_URL at http://s3proxy:80 and use S3PROXY_IDENTITY/S3PROXY_CREDENTIAL
+  # as AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY.
+  s3proxy:
+    image: andrewgaul/s3proxy:${S3PROXY_TAG:-latest}
+    profiles:
+    - azure
+    restart: unless-stopped
+    environment:
+      S3PROXY_AUTHORIZATION: aws-v2-or-v4
+      S3PROXY_ENDPOINT: http://0.0.0.0:80
+      S3PROXY_IDENTITY: ${AWS_ACCESS_KEY_ID:-}
+      S3PROXY_CREDENTIAL: ${AWS_SECRET_ACCESS_KEY:-}
+      JCLOUDS_PROVIDER: azureblob
+      JCLOUDS_ENDPOINT: https://${AZURE_STORAGE_ACCOUNT:-}.blob.core.windows.net
+      JCLOUDS_IDENTITY: ${AZURE_STORAGE_ACCOUNT:-}
+      JCLOUDS_CREDENTIAL: ${AZURE_STORAGE_KEY:-}
+volumes:
+  archive-data: null
