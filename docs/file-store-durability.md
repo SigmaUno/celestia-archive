@@ -22,6 +22,14 @@ through `Get`, `Stat`, and `List` do not sync. Read-back alone does not establis
 durability.
 Temporary names can survive a crash without affecting the published object.
 
+Live archiving and prune verification also check local manifest durability
+before accepting its progress or issuing verified pruning evidence. This
+includes archive runs with no new blocks, verification with previous evidence,
+and pruning through the read-only local-store wrapper. A visible manifest left
+by a failed replacement cannot bypass a persistent directory-sync failure.
+Ordinary `LoadManifest`, verification for inspection, and cold serving still
+only read; S3 receives no additional requests for these durability checks.
+
 The implementation uses only Go's `os.File.Sync`, without ignoring unsupported
 directory sync errors. Filesystems that reject directory synchronization cannot
 successfully publish through this backend. On Darwin, Go attempts `F_FULLFSYNC`

@@ -170,7 +170,7 @@ func ArchiveReady(ctx context.Context, reader BlockReader, store ObjectStore, op
 }
 
 func loadOrCreateLiveManifest(ctx context.Context, store ObjectStore, key, chainID string) (Manifest, error) {
-	manifest, err := LoadManifest(ctx, store, key)
+	manifest, err := loadDurableManifest(ctx, store, key)
 	if errors.Is(err, ErrObjectNotFound) {
 		return NewManifest(chainID, nil)
 	}
