@@ -1,6 +1,7 @@
 package blocksyncarchive
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"slices"
@@ -25,9 +26,15 @@ type ArchiveBlockSource struct {
 	manifestKey      string
 	manifestCacheTTL time.Duration
 
-	mu               sync.Mutex
-	cachedManifest   archive.Manifest
-	cachedManifestAt time.Time
+	mu                sync.Mutex
+	cachedManifest    archive.Manifest
+	cachedManifestAt  time.Time
+	segmentCacheBytes int64
+	segmentBytes      int64
+	segments          map[[32]byte]*list.Element
+	segmentLRU        list.List
+	segmentLoads      map[[32]byte]*segmentLoad
+	closed            chan struct{}
 }
 
 func NewArchiveBlockSource(store archive.ObjectStore, manifestKey string) (*ArchiveBlockSource, error) {
@@ -41,9 +48,13 @@ func NewArchiveBlockSource(store archive.ObjectStore, manifestKey string) (*Arch
 		return nil, err
 	}
 	return &ArchiveBlockSource{
-		store:            store,
-		manifestKey:      manifestKey,
-		manifestCacheTTL: DefaultColdManifestCacheTTL,
+		store:             store,
+		manifestKey:       manifestKey,
+		manifestCacheTTL:  DefaultColdManifestCacheTTL,
+		segmentCacheBytes: DefaultColdSegmentCacheBytes,
+		segments:          make(map[[32]byte]*list.Element),
+		segmentLoads:      make(map[[32]byte]*segmentLoad),
+		closed:            make(chan struct{}),
 	}, nil
 }
 
@@ -89,23 +100,25 @@ func (s *ArchiveBlockSource) LoadBlock(ctx context.Context, height int64) (*type
 	if !ok {
 		return nil, ErrColdBlockNotFound
 	}
-	data, err := s.store.Get(ctx, segment.Key)
+	records, err := s.loadSegment(ctx, segment)
 	if err != nil {
 		return nil, err
 	}
-	block, err := archive.DecodeSegmentBlock(data, segment, height)
-	if errors.Is(err, archive.ErrSegmentBlockNotFound) {
-		return nil, ErrColdBlockNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return block, nil
+	return archive.RecordToBlock(records[height-segment.FirstHeight])
 }
 
 func (s *ArchiveBlockSource) loadManifest(ctx context.Context) (archive.Manifest, error) {
+	if err := ctx.Err(); err != nil {
+		return archive.Manifest{}, err
+	}
 	now := time.Now()
 	s.mu.Lock()
+	select {
+	case <-s.closed:
+		s.mu.Unlock()
+		return archive.Manifest{}, errColdSourceClosed
+	default:
+	}
 	if !s.cachedManifestAt.IsZero() && s.manifestCacheTTL > 0 && now.Sub(s.cachedManifestAt) < s.manifestCacheTTL {
 		manifest := s.cachedManifest
 		s.mu.Unlock()
@@ -118,6 +131,12 @@ func (s *ArchiveBlockSource) loadManifest(ctx context.Context) (archive.Manifest
 		return archive.Manifest{}, err
 	}
 	s.mu.Lock()
+	select {
+	case <-s.closed:
+		s.mu.Unlock()
+		return archive.Manifest{}, errColdSourceClosed
+	default:
+	}
 	s.cachedManifest = manifest
 	s.cachedManifestAt = now
 	s.mu.Unlock()
