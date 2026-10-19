@@ -235,7 +235,10 @@ func (s *LocalObjectStore) Put(_ context.Context, key string, data []byte) error
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return syncLocalObjectDirectories(filepath.Dir(path))
 }
 
 func (s *LocalObjectStore) PutIfAbsent(_ context.Context, key string, data []byte) error {
@@ -280,7 +283,34 @@ func (s *LocalObjectStore) PutIfAbsent(_ context.Context, key string, data []byt
 		}
 		return err
 	}
-	return nil
+	return syncLocalObjectDirectories(dir)
+}
+
+// Sync every ancestor, including existing ones: an earlier failed publication
+// may have left directory entries visible but not durable.
+func syncLocalObjectDirectories(dir string) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	for {
+		if err := syncLocalDirectory(dir); err != nil {
+			return fmt.Errorf("sync local object directory %q: %w", dir, err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		dir = parent
+	}
+}
+
+var syncLocalDirectory = func(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Sync(), f.Close())
 }
 
 func (s *LocalObjectStore) Exists(_ context.Context, key string) (bool, error) {
