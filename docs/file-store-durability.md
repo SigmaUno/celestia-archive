@@ -11,8 +11,15 @@ directory sync per path component per publication.
 on filesystems that provide atomic rename. `PutIfAbsent` publishes by hard link,
 preserving create-if-absent collision behavior. Neither method treats a sync
 failure as success. A failed call can nevertheless leave the published object
-visible; read-back alone does not establish durability, and a storage sync
-failure must be resolved before permitting pruning or reusing those objects.
+visible. Before reporting an existing object, `Exists` syncs its containing
+directory and ancestors, so automatic archive retries cannot reuse a segment
+whose directory sync still fails. `PutIfAbsent` also completes these syncs before
+returning `ErrObjectAlreadyExists`; sync failures return an error without that
+sentinel, preventing callers from treating them as reusable collisions. These
+paths assume objects were written by this backend, which syncs file contents
+before publication, and the normal single-writer archive model. Cold reads
+through `Get`, `Stat`, and `List` do not sync. Read-back alone does not establish
+durability.
 Temporary names can survive a crash without affecting the published object.
 
 The implementation uses only Go's `os.File.Sync`, without ignoring unsupported

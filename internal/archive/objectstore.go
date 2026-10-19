@@ -279,6 +279,9 @@ func (s *LocalObjectStore) PutIfAbsent(_ context.Context, key string, data []byt
 	}
 	if err := os.Link(tmpName, path); err != nil {
 		if errors.Is(err, os.ErrExist) {
+			if err := syncLocalObjectDirectories(dir); err != nil {
+				return err
+			}
 			return ErrObjectAlreadyExists
 		}
 		return err
@@ -330,6 +333,11 @@ func (s *LocalObjectStore) Exists(_ context.Context, key string) (bool, error) {
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return false, fmt.Errorf("local object %q is a symlink", key)
+	}
+	// Archiving reuses existing segments after this check; visibility alone
+	// does not establish durability after a failed publication sync.
+	if err := syncLocalObjectDirectories(filepath.Dir(path)); err != nil {
+		return false, err
 	}
 	return true, nil
 }
