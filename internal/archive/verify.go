@@ -40,6 +40,10 @@ func Verify(ctx context.Context, store ObjectStore, opts VerifyOptions) (VerifyR
 	if err != nil {
 		return VerifyResult{}, err
 	}
+	return verifyManifest(ctx, store, manifest, opts)
+}
+
+func verifyManifest(ctx context.Context, store ObjectStore, manifest Manifest, opts VerifyOptions) (VerifyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return VerifyResult{}, err
 	}

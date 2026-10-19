@@ -944,9 +944,7 @@ func startLiveIngestorMaintenanceLoop(
 		archiveInterval = 30 * time.Second
 	}
 	lastPrune := time.Time{}
-	// verifiedThrough lets each prune re-check only segments archived since
-	// the previous successful verification.
-	var verifiedThrough int64
+	var verifiedSnapshot *archive.VerifiedArchive
 	runMaintenance := func() bool {
 		archived, archiveErr := archive.ArchiveReadyFromHead(ctx, ingestor.BlockReader(), objectStore, archiveOpts, safetyWindow)
 		if archiveErr != nil {
@@ -962,17 +960,17 @@ func startLiveIngestorMaintenanceLoop(
 		}
 		// Verify object storage before taking the exclusive hot store lock so
 		// slow remote reads never stall block ingestion.
-		verified, verifyErr := verifyLiveArchive(ctx, objectStore, pruneOpts, verifiedThrough)
+		verified, verifyErr := verifyLiveArchive(ctx, objectStore, pruneOpts, verifiedSnapshot)
 		if verifyErr != nil {
 			if ctx.Err() != nil {
 				return false
 			}
-			verifiedThrough = 0
+			verifiedSnapshot = nil
 			stats.recordPrune(0, verifyErr)
 			return true
 		}
-		verifiedThrough = verified
-		if verified == 0 {
+		verifiedSnapshot = verified
+		if verified == nil {
 			stats.recordPrune(0, nil)
 			lastPrune = time.Now()
 			return true
@@ -998,25 +996,18 @@ func startLiveIngestorMaintenanceLoop(
 	return errCh
 }
 
-// verifyLiveArchive verifies segments archived above verifiedThrough and
-// returns the new verified height, or zero when nothing is archived yet.
+// verifyLiveArchive returns nil when nothing is archived yet.
 func verifyLiveArchive(
 	ctx context.Context,
 	objectStore archive.ObjectStore,
 	opts archive.PruneHotOptions,
-	verifiedThrough int64,
-) (int64, error) {
-	manifest, err := archive.LoadManifest(ctx, objectStore, opts.ManifestKey)
+	previous *archive.VerifiedArchive,
+) (*archive.VerifiedArchive, error) {
+	verified, err := archive.VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, previous)
 	if errors.Is(err, archive.ErrObjectNotFound) {
-		return 0, nil
+		return nil, nil //nolint:nilnil // No archive means no pruning authority.
 	}
-	if err != nil {
-		return 0, err
-	}
-	if manifest.LastHeight == 0 {
-		return 0, nil
-	}
-	return archive.VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, verifiedThrough+1)
+	return verified, err
 }
 
 func archiveRange(summary archive.InspectSummary) string {

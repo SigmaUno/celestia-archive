@@ -1124,6 +1124,97 @@ func TestLiveIngestorMaintenanceLoopDoesNotExitOrPruneOnCorruptArchive(t *testin
 	}
 }
 
+func TestLiveMaintenanceRejectsUnrelatedArchive(t *testing.T) {
+	for _, kind := range []string{"partial", "wrong-chain", "divergent"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dbDir := filepath.Join(t.TempDir(), "db")
+			createCLIBlockStoreFixture(t, dbDir, 5)
+			reader, err := archive.OpenCometBlockStore(dbDir, "goleveldb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			ingestor, err := blocksyncarchive.NewHotIngestor(reader, blocksyncarchive.IngestOptions{ChainID: cliTestChainID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			objectStore, err := archive.NewLocalObjectStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			chain := cliTestChainID
+			first := int64(1)
+			if kind == "partial" {
+				first = 3
+			}
+			if kind == "wrong-chain" {
+				chain = "other-chain"
+			}
+			var records []archive.BlockRecord
+			for h := first; h <= 4; h++ {
+				block := makeCLITestBlock(h)
+				block.ChainID = chain
+				if kind == "divergent" && h == 4 {
+					block.AppHash = []byte("divergent")
+				}
+				record, err := archive.BlockToRecord(block)
+				if err != nil {
+					t.Fatal(err)
+				}
+				records = append(records, record)
+			}
+			data, segment, err := archive.EncodeSegment(records, archive.CompressionGzip)
+			if err != nil {
+				t.Fatal(err)
+			}
+			segment.Key = "unrelated-segment"
+			if err := objectStore.Put(ctx, segment.Key, data); err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := archive.NewManifest(chain, []archive.SegmentManifest{segment})
+			if err != nil {
+				t.Fatal(err)
+			}
+			const manifestKey = "unrelated-manifest.json"
+			if err := archive.SaveManifest(ctx, objectStore, manifestKey, manifest); err != nil {
+				t.Fatal(err)
+			}
+			stats := newLiveMaintenanceStats()
+			errCh := startLiveIngestorMaintenanceLoop(ctx, ingestor, objectStore, archive.LiveArchiveOptions{
+				ChainID: cliTestChainID, Prefix: "archive", SegmentBlocks: 2, Compression: archive.CompressionGzip,
+			}, 1, time.Hour, archive.PruneHotOptions{
+				ManifestKey: manifestKey, RetainBlocks: 1, EvidenceMaxAgeBlocks: 1, EvidenceMaxAgeDuration: time.Nanosecond,
+			}, time.Hour, stats)
+			deadline := time.After(2 * time.Second)
+			for stats.snapshot()[liveMetricPruneErrors] == int64(0) {
+				select {
+				case err := <-errCh:
+					t.Fatalf("maintenance exited: %v", err)
+				case <-deadline:
+					t.Fatal("unsafe archive did not produce a prune error")
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if err := ingestor.WithHotStore(func(bs *store.BlockStore) error {
+				if bs.Base() != 1 {
+					t.Fatalf("base changed: %d", bs.Base())
+				}
+				for h := int64(1); h <= 5; h++ {
+					if bs.LoadBlock(h) == nil {
+						t.Fatalf("hot block %d was deleted", h)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestLiveIngestorMaintenanceLoopArchivesThenPrunes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
