@@ -3,6 +3,7 @@ package archive
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -152,12 +153,12 @@ func TestVerifyArchiveForPruneChecksOnlyNewSegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	verified, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, 0)
+	verified, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified != 2 {
-		t.Fatalf("verified through %d, want 2", verified)
+	if verified.manifest.LastHeight != 2 {
+		t.Fatalf("verified through %d, want 2", verified.manifest.LastHeight)
 	}
 
 	// Corrupt the already verified segment; incremental checks must skip it.
@@ -170,51 +171,152 @@ func TestVerifyArchiveForPruneChecksOnlyNewSegments(t *testing.T) {
 	if putErr := objectStore.Put(ctx, firstKey, data); putErr != nil {
 		t.Fatal(putErr)
 	}
-	same, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, verified+1)
+	same, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, verified)
 	if err != nil {
 		t.Fatalf("incremental verify with no new segments: %v", err)
 	}
-	if same != 2 {
-		t.Fatalf("verified through %d with no new segments, want 2", same)
+	if same.manifest.LastHeight != 2 {
+		t.Fatalf("verified through %d with no new segments, want 2", same.manifest.LastHeight)
 	}
 
 	archiveOpts.ReadyHeight = 4
 	if _, archiveErr := ArchiveReady(ctx, reader, objectStore, archiveOpts); archiveErr != nil {
 		t.Fatal(archiveErr)
 	}
-	next, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, verified+1)
+	next, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, verified)
 	if err != nil {
 		t.Fatalf("incremental verify of new segment: %v", err)
 	}
-	if next != 4 {
-		t.Fatalf("verified through %d, want 4", next)
+	if next.manifest.LastHeight != 4 {
+		t.Fatalf("verified through %d, want 4", next.manifest.LastHeight)
 	}
-	if _, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, 0); err == nil {
+	if _, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, nil); err == nil {
 		t.Fatal("expected full verify to detect corrupt first segment")
 	}
-	if _, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, 10); err == nil {
-		t.Fatal("expected error when manifest is below previously verified height")
+	// Changing a previously verified index must force object verification again.
+	manifest, err := LoadManifest(ctx, objectStore, archived.ManifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Segments[0].Blocks[0].Hash = strings.Repeat("a", 64)
+	if err := SaveManifest(ctx, objectStore, archived.ManifestKey, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyArchiveForPrune(ctx, objectStore, archived.ManifestKey, next); err == nil {
+		t.Fatal("changed manifest prefix reused previous verification")
 	}
 }
 
-func TestPruneHotStoreThroughUsesVerifiedHeight(t *testing.T) {
-	dbDir := filepath.Join(t.TempDir(), "db")
-	createBlockStoreFixture(t, dbDir, 6)
-	reader, err := OpenCometBlockStore(dbDir, "goleveldb")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	result, err := PruneHotStoreThrough(reader, PruneHotOptions{
-		ManifestKey:            "unused",
-		RetainBlocks:           1,
-		EvidenceMaxAgeBlocks:   1,
-		EvidenceMaxAgeDuration: time.Nanosecond,
-	}, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.PruneToHeight != 4 || result.BaseAfter != 4 || result.ArchivedThrough != 3 {
-		t.Fatalf("unexpected prune result: %+v", result)
+func TestPruningRequiresMatchingCompleteCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		first, last, hotBase int64
+		chain                string
+		divergent            bool
+		wantBase             int64
+	}{
+		{name: "full", first: 1, last: 5, hotBase: 1, chain: testChainID, wantBase: 5},
+		{name: "partial covers hot base", first: 3, last: 4, hotBase: 3, chain: testChainID, wantBase: 5},
+		{name: "partial leaves gap", first: 3, last: 5, hotBase: 1, chain: testChainID},
+		{name: "wrong chain", first: 1, last: 5, hotBase: 1, chain: "other-chain"},
+		{name: "divergent last candidate", first: 1, last: 5, hotBase: 1, chain: testChainID, divergent: true},
+	} {
+		for _, standalone := range []bool{true, false} {
+			name := tc.name + "/shared"
+			if standalone {
+				name = tc.name + "/standalone"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				dbDir := filepath.Join(t.TempDir(), "db")
+				createBlockStoreFixture(t, dbDir, 6)
+				reader, err := OpenCometBlockStore(dbDir, "goleveldb")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reader.Close()
+				opts := PruneHotOptions{ManifestKey: "manifest.json", RetainBlocks: 2, EvidenceMaxAgeBlocks: 1, EvidenceMaxAgeDuration: time.Nanosecond}
+				if tc.hotBase > 1 {
+					state, err := pruneState(reader, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, _, err := reader.PruneBlocks(tc.hotBase, state); err != nil {
+						t.Fatal(err)
+					}
+				}
+				objectStore, err := NewLocalObjectStore(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var records []BlockRecord
+				for h := tc.first; h <= tc.last; h++ {
+					block := makeTestBlock(t, h)
+					block.ChainID = tc.chain
+					if tc.divergent && h == 4 {
+						block.AppHash = []byte("divergent")
+					}
+					record, err := BlockToRecord(block)
+					if err != nil {
+						t.Fatal(err)
+					}
+					records = append(records, record)
+				}
+				data, segment, err := EncodeSegment(records, CompressionGzip)
+				if err != nil {
+					t.Fatal(err)
+				}
+				segment.Key = "segment"
+				if err := objectStore.Put(ctx, segment.Key, data); err != nil {
+					t.Fatal(err)
+				}
+				manifest, err := NewManifest(tc.chain, []SegmentManifest{segment})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := SaveManifest(ctx, objectStore, opts.ManifestKey, manifest); err != nil {
+					t.Fatal(err)
+				}
+				verified, err := VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, nil)
+				if err != nil {
+					t.Fatalf("archive must be valid: %v", err)
+				}
+				if standalone {
+					_, err = PruneVerifiedHotStore(ctx, reader, objectStore, opts)
+				} else {
+					if tc.name == "full" {
+						manifest.ChainID = "replacement-chain"
+						manifest.Segments[0].Blocks[0].Hash = strings.Repeat("a", 64)
+						if err := SaveManifest(ctx, objectStore, opts.ManifestKey, manifest); err != nil {
+							t.Fatal(err)
+						}
+					}
+					_, err = PruneHotStoreThrough(reader, opts, verified)
+				}
+				if tc.wantBase == 0 {
+					if err == nil {
+						t.Fatal("expected unsafe prune to fail")
+					}
+					if reader.Base() != tc.hotBase {
+						t.Fatalf("base changed: %d", reader.Base())
+					}
+					for h := tc.hotBase; h <= 6; h++ {
+						if reader.LoadBlock(h) == nil {
+							t.Fatalf("hot block %d was deleted", h)
+						}
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					if reader.Base() != tc.wantBase {
+						t.Fatalf("base = %d, want %d", reader.Base(), tc.wantBase)
+					}
+					if reader.LoadBlock(tc.wantBase-1) != nil {
+						t.Fatal("covered block was not pruned")
+					}
+				}
+			})
+		}
 	}
 }
