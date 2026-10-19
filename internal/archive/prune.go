@@ -2,8 +2,10 @@ package archive
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	sm "github.com/cometbft/cometbft/state"
@@ -37,48 +39,65 @@ func PruneVerifiedHotStore(ctx context.Context, blockStore *store.BlockStore, ob
 	if err := validatePruneHotOptions(opts); err != nil {
 		return PruneHotResult{}, err
 	}
-	verifiedThrough, err := VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, 0)
+	verified, err := VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, nil)
 	if err != nil {
 		return PruneHotResult{}, err
 	}
-	return PruneHotStoreThrough(blockStore, opts, verifiedThrough)
+	return PruneHotStoreThrough(blockStore, opts, verified)
 }
 
-// VerifyArchiveForPrune verifies archive segments that end at or above
-// fromHeight and returns the manifest height the archive is verified through.
-// It only reads object storage, so callers can run it without exclusive
-// access to the hot store. Pass the previous result plus one to verify only
-// segments archived since the last run.
-func VerifyArchiveForPrune(ctx context.Context, objectStore ObjectStore, manifestKey string, fromHeight int64) (int64, error) {
+// VerifiedArchive binds pruning authority to a fully verified manifest snapshot.
+// Its contents are private so callers cannot alter the verified evidence.
+type VerifiedArchive struct {
+	manifestKey string
+	manifest    Manifest
+}
+
+// VerifyArchiveForPrune verifies a single manifest snapshot. Previous evidence
+// skips object reads only for an unchanged prefix of that manifest.
+// An empty manifest returns nil evidence.
+func VerifyArchiveForPrune(ctx context.Context, objectStore ObjectStore, manifestKey string, previous *VerifiedArchive) (*VerifiedArchive, error) {
 	if manifestKey == "" {
-		return 0, errors.New("manifest key is required")
+		return nil, errors.New("manifest key is required")
 	}
 	if objectStore == nil {
-		return 0, errors.New("object store is required")
+		return nil, errors.New("object store is required")
 	}
-	result, err := Verify(ctx, objectStore, VerifyOptions{ManifestKey: manifestKey, FromHeight: fromHeight})
+	manifest, err := LoadManifest(ctx, objectStore, manifestKey)
 	if err != nil {
-		return 0, fmt.Errorf("verify archive before prune: %w", err)
+		return nil, fmt.Errorf("verify archive before prune: %w", err)
 	}
-	if fromHeight <= 1 && result.BlocksChecked == 0 {
-		return 0, errors.New("archive verification checked no blocks")
+	if len(manifest.Segments) == 0 {
+		return nil, nil //nolint:nilnil // No archive means no pruning authority.
 	}
-	if result.VerifiedThrough < fromHeight-1 {
-		return 0, fmt.Errorf("archive manifest last height %d is below previously verified height %d", result.VerifiedThrough, fromHeight-1)
+	var fromHeight int64
+	if previous != nil && previous.manifestKey == manifestKey &&
+		previous.manifest.ChainID == manifest.ChainID && previous.manifest.FirstHeight == manifest.FirstHeight &&
+		len(previous.manifest.Segments) <= len(manifest.Segments) &&
+		reflect.DeepEqual(previous.manifest.Segments, manifest.Segments[:len(previous.manifest.Segments)]) {
+		fromHeight = previous.manifest.LastHeight + 1
 	}
-	return result.VerifiedThrough, nil
+	if _, err := verifyManifest(ctx, objectStore, manifest, VerifyOptions{FromHeight: fromHeight}); err != nil {
+		return nil, fmt.Errorf("verify archive before prune: %w", err)
+	}
+	return &VerifiedArchive{manifestKey: manifestKey, manifest: manifest}, nil
 }
 
-// PruneHotStoreThrough prunes hot blocks at or below archivedThrough while
-// keeping opts.RetainBlocks at the head. archivedThrough must come from
-// VerifyArchiveForPrune; this function performs no object store I/O.
-func PruneHotStoreThrough(blockStore *store.BlockStore, opts PruneHotOptions, archivedThrough int64) (PruneHotResult, error) {
+// PruneHotStoreThrough compares verified coverage and hashes before deleting.
+// Callers must hold exclusive access to the hot store for this entire call;
+// this function performs no object store I/O.
+func PruneHotStoreThrough(blockStore *store.BlockStore, opts PruneHotOptions, verified *VerifiedArchive) (PruneHotResult, error) {
 	if blockStore == nil {
 		return PruneHotResult{}, errors.New("block store is required")
 	}
 	if err := validatePruneHotOptions(opts); err != nil {
 		return PruneHotResult{}, err
 	}
+	if verified == nil || verified.manifestKey != opts.ManifestKey {
+		return PruneHotResult{}, errors.New("verified archive snapshot is required for this manifest")
+	}
+	manifest := verified.manifest
+	archivedThrough := manifest.LastHeight
 	base := blockStore.Base()
 	head := blockStore.Height()
 	result := PruneHotResult{
@@ -98,6 +117,30 @@ func PruneHotStoreThrough(blockStore *store.BlockStore, opts PruneHotOptions, ar
 	}
 	if pruneTo > head {
 		pruneTo = head
+	}
+	if manifest.FirstHeight > base {
+		return PruneHotResult{}, fmt.Errorf("archive starts at %d, leaving hot blocks from %d uncovered", manifest.FirstHeight, base)
+	}
+	latest := blockStore.LoadBlockMeta(head)
+	if latest == nil || latest.Header.ChainID != manifest.ChainID {
+		return PruneHotResult{}, errors.New("archive chain does not match hot store")
+	}
+	for _, segment := range manifest.Segments {
+		if segment.LastHeight < base {
+			continue
+		}
+		if segment.FirstHeight >= pruneTo {
+			break
+		}
+		for _, index := range segment.Blocks {
+			if index.Height < base || index.Height >= pruneTo {
+				continue
+			}
+			meta := blockStore.LoadBlockMeta(index.Height)
+			if meta == nil || meta.Header.ChainID != manifest.ChainID || hex.EncodeToString(meta.BlockID.Hash) != index.Hash {
+				return PruneHotResult{}, fmt.Errorf("archive does not match hot block %d", index.Height)
+			}
+		}
 	}
 	state, err := pruneState(blockStore, opts)
 	if err != nil {
