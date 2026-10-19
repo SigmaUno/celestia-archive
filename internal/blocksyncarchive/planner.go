@@ -37,17 +37,21 @@ type Request struct {
 }
 
 type RequestPlanner struct {
-	peers    map[PeerID]PeerRange
-	inflight map[int64]inflightRequest
-	received map[int64]struct{}
-	noBlocks map[PeerID]map[int64]struct{}
-	timeouts map[PeerID]map[int64]struct{}
-	rejected map[PeerID]map[int64]struct{}
+	peers          map[PeerID]PeerRange
+	inflight       map[int64]inflightRequest
+	received       map[int64]struct{}
+	noBlocks       map[PeerID]map[int64]struct{}
+	timeouts       map[PeerID]map[int64]struct{}
+	rejected       map[PeerID]map[int64]struct{}
+	recoveryHeight int64
+	recoveryPeer   PeerID
+	recoveryTried  map[PeerID]bool
 }
 
 type inflightRequest struct {
 	PeerID      PeerID
 	RequestedAt time.Time
+	LocalRetry  bool
 }
 
 func NewRequestPlanner() *RequestPlanner {
@@ -114,7 +118,39 @@ func (p *RequestPlanner) RejectAt(id PeerID, height int64) {
 
 func (p *RequestPlanner) RetryLater(id PeerID, height int64) {
 	p.MarkFailed(height)
-	p.inflight[height] = inflightRequest{PeerID: id, RequestedAt: time.Now()}
+	p.inflight[height] = inflightRequest{PeerID: id, RequestedAt: time.Now(), LocalRetry: true}
+}
+
+// simplify: recovery needs one provider for both heights; cross-provider recovery requires independent fork evidence.
+func (p *RequestPlanner) RecoverPair(height int64) {
+	if p.recoveryHeight != height {
+		p.recoveryTried = make(map[PeerID]bool)
+	}
+	p.recoveryHeight, p.recoveryPeer = height, ""
+	for h := range p.inflight {
+		if h >= height {
+			delete(p.inflight, h)
+		}
+	}
+	for h := range p.received {
+		if h >= height {
+			delete(p.received, h)
+		}
+	}
+}
+
+func (p *RequestPlanner) recoveryFailed(id PeerID) bool {
+	h := p.recoveryHeight
+	r := p.peers[id]
+	for _, height := range []int64{h, h + 1} {
+		if !r.Contains(height) || p.peerReturnedNoBlock(id, height) || p.peerTimedOut(id, height) {
+			return true
+		}
+		if _, rejected := p.rejected[id][height]; rejected {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *RequestPlanner) MarkReceived(height int64) {
@@ -149,6 +185,10 @@ func (p *RequestPlanner) ExpireInflight(now time.Time, timeout time.Duration) in
 			continue
 		}
 		delete(p.inflight, height)
+		if inflight.LocalRetry {
+			expired++
+			continue
+		}
 		if p.timeouts[inflight.PeerID] == nil {
 			p.timeouts[inflight.PeerID] = make(map[int64]struct{})
 		}
@@ -205,7 +245,30 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 	if len(p.peers) == 0 {
 		return nil, ErrNoPeers
 	}
+	if p.recoveryHeight > 0 && nextHeight > p.recoveryHeight+1 {
+		p.recoveryHeight, p.recoveryPeer, p.recoveryTried = 0, "", nil
+	}
+	if p.recoveryHeight > 0 && p.recoveryPeer == "" {
+		ids := make([]PeerID, 0, len(p.peers))
+		for id := range p.peers {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		for _, id := range ids {
+			if !p.recoveryTried[id] && !p.recoveryFailed(id) {
+				p.recoveryPeer = id
+				p.recoveryTried[id] = true
+				break
+			}
+		}
+		if p.recoveryPeer == "" {
+			return nil, ErrNoPeerForHeight
+		}
+	}
 	best := p.BestHeight()
+	if p.recoveryHeight > 0 {
+		best = p.recoveryHeight + 1
+	}
 	if best < nextHeight {
 		return nil, nil
 	}
@@ -222,7 +285,10 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 		if _, exists := p.received[height]; exists {
 			continue
 		}
-		peerID, ok := p.peerForHeight(height)
+		peerID, ok := p.recoveryPeer, p.recoveryPeer != ""
+		if !ok {
+			peerID, ok = p.peerForHeight(height)
+		}
 		if !ok {
 			if len(requests) == 0 {
 				return nil, fmt.Errorf("%w: %d", ErrNoPeerForHeight, height)

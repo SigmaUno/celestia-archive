@@ -19,6 +19,7 @@ import (
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	cmtstore "github.com/cometbft/cometbft/store"
+	"github.com/cometbft/cometbft/types"
 	"github.com/spf13/cobra"
 
 	"github.com/01builders/cometbft-archive/internal/archive"
@@ -604,9 +605,20 @@ func newServeCommand() (*cobra.Command, error) {
 					}
 					validatorSetSource = source
 				}
+				coldSource, err := blocksyncarchive.NewArchiveBlockSource(store, key)
+				if err != nil {
+					return err
+				}
+				if ttlErr := coldSource.SetManifestCacheTTL(coldManifestCacheTTL); ttlErr != nil {
+					return ttlErr
+				}
+				predecessor, err := liveIngestPredecessor(cmd.Context(), blockStore, summary, coldSource, flags.chainID)
+				if err != nil {
+					return err
+				}
 				ingestor, err := blocksyncarchive.NewHotIngestor(blockStore, blocksyncarchive.IngestOptions{
 					ChainID:            flags.chainID,
-					StartHeight:        liveIngestStartHeight(blockStore, summary),
+					Predecessor:        predecessor,
 					SafetyWindow:       safetyWindow,
 					Validation:         blocksyncarchive.ValidationMode(validationMode),
 					Checkpoints:        checkpoints,
@@ -616,13 +628,7 @@ func newServeCommand() (*cobra.Command, error) {
 				if err != nil {
 					return err
 				}
-				coldSource, err := blocksyncarchive.NewArchiveBlockSource(store, key)
-				if err != nil {
-					return err
-				}
-				if ttlErr := coldSource.SetManifestCacheTTL(coldManifestCacheTTL); ttlErr != nil {
-					return ttlErr
-				}
+
 				nodeLogger, err := cmtflags.ParseLogLevel(logLevel, cmtlog.NewTMLogger(cmtlog.NewSyncWriter(cmd.ErrOrStderr())), "info")
 				if err != nil {
 					return fmt.Errorf("log-level: %w", err)
@@ -861,11 +867,21 @@ type blockStoreHeightReader interface {
 	Height() int64
 }
 
-func liveIngestStartHeight(blockStore blockStoreHeightReader, summary archive.InspectSummary) int64 {
-	if blockStore != nil && blockStore.Height() == 0 && summary.LastHeight > 0 {
-		return summary.LastHeight + 1
+func liveIngestPredecessor(ctx context.Context, blockStore blockStoreHeightReader, summary archive.InspectSummary, source blocksyncarchive.ColdBlockSource, chainID string) (*types.Block, error) {
+	if blockStore.Height() > 0 || summary.LastHeight == 0 {
+		return nil, nil
 	}
-	return 0
+	if summary.ChainID != chainID {
+		return nil, fmt.Errorf("archive chain ID %q, expected %q", summary.ChainID, chainID)
+	}
+	tip, err := source.LoadBlock(ctx, summary.LastHeight)
+	if err != nil {
+		return nil, fmt.Errorf("load archive predecessor %d: %w", summary.LastHeight, err)
+	}
+	if tip == nil || tip.Height != summary.LastHeight || tip.ChainID != chainID {
+		return nil, errors.New("archive predecessor height or chain ID mismatch")
+	}
+	return tip, nil
 }
 
 func markRequired(cmd *cobra.Command, names ...string) error {

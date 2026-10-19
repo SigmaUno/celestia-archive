@@ -464,12 +464,10 @@ func (r *Reactor) submitAndDrainBuffered(peerID PeerID, block *types.Block) bool
 			var conflict *pendingConflictError
 			switch {
 			case errors.As(err, &conflict):
-				// Neither side of a conflicting pair proves which provider lied.
-				// Try each pending provider at most once at this height.
-				r.planner.RejectAt(conflict.peerID, conflict.height)
-				r.planner.MarkFailed(conflict.height)
-				r.bufferedResponses[block.Height] = bufferedBlockResponse{peerID: peerID, block: block}
-				r.planner.MarkReceived(block.Height)
+				r.recoverPairLocked(conflict.height)
+				if conflict.peerID == peerID {
+					r.planner.recoveryTried[peerID] = true
+				}
 			case errors.Is(err, errValidationSource):
 				r.planner.RetryLater(peerID, block.Height)
 			default:
@@ -638,8 +636,21 @@ func (r *Reactor) expireRequestsAndPlan() {
 	}
 }
 
+func (r *Reactor) recoverPairLocked(height int64) {
+	r.ingestor.discardPending()
+	r.planner.RecoverPair(height)
+	for h := range r.bufferedResponses {
+		if h >= height {
+			delete(r.bufferedResponses, h)
+		}
+	}
+}
+
 func (r *Reactor) planAndSend() {
 	r.mu.Lock()
+	if id := r.planner.recoveryPeer; id != "" && r.ingestor.NextHeight() <= r.planner.recoveryHeight+1 && r.planner.recoveryFailed(id) {
+		r.recoverPairLocked(r.planner.recoveryHeight)
+	}
 	requests, err := r.planner.PlanAt(r.ingestor.NextHeight(), r.opts.RequestLimit, time.Now())
 	if err != nil {
 		r.mu.Unlock()

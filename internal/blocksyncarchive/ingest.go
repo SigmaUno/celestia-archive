@@ -35,6 +35,7 @@ func (e *pendingConflictError) Unwrap() error { return e.err }
 type IngestOptions struct {
 	ChainID            string
 	StartHeight        int64
+	Predecessor        *types.Block // Trusted archived tip for an empty hot store.
 	SafetyWindow       int64
 	Validation         ValidationMode
 	Checkpoints        map[int64]string
@@ -94,6 +95,15 @@ func NewHotIngestor(blockStore *store.BlockStore, opts IngestOptions) (*HotInges
 	if opts.StartHeight < 0 {
 		return nil, errors.New("start height cannot be negative")
 	}
+	if tip := opts.Predecessor; tip != nil {
+		if blockStore.Height() != 0 || tip.Height <= 0 || tip.ChainID != opts.ChainID || len(tip.Hash()) == 0 {
+			return nil, errors.New("invalid archive predecessor for empty hot store")
+		}
+		if opts.StartHeight != 0 && opts.StartHeight != tip.Height+1 {
+			return nil, errors.New("start height must follow archive predecessor")
+		}
+		opts.StartHeight = tip.Height + 1
+	}
 	if opts.StartHeight <= 0 {
 		opts.StartHeight = blockStore.Height() + 1
 		if opts.StartHeight == 1 && blockStore.Base() > 0 {
@@ -127,7 +137,13 @@ func NewHotIngestor(blockStore *store.BlockStore, opts IngestOptions) (*HotInges
 	if opts.SafetyWindow < 0 {
 		return nil, errors.New("safety window cannot be negative")
 	}
-	return &HotIngestor{store: blockStore, opts: opts}, nil
+	ingestor := &HotIngestor{store: blockStore, opts: opts}
+	if opts.Predecessor != nil {
+		if err := ingestor.validateBlock(opts.Predecessor); err != nil {
+			return nil, fmt.Errorf("archive predecessor: %w", err)
+		}
+	}
+	return ingestor, nil
 }
 
 func (i *HotIngestor) NextHeight() int64 {
@@ -211,12 +227,16 @@ func (i *HotIngestor) submit(block *types.Block, peerID PeerID) (IngestResult, e
 	}
 	result := IngestResult{Accepted: block.Height}
 	if i.pending == nil {
+		previous := i.opts.Predecessor
 		if height := i.store.Height(); height > 0 {
-			if _, err := i.validatePredecessor(i.store.LoadBlock(height), block); err != nil {
+			previous = i.store.LoadBlock(height)
+		}
+		if previous != nil {
+			if _, err := i.validatePredecessor(previous, block); err != nil {
 				return IngestResult{}, err
 			}
 		}
-		// An empty store intentionally permits an unanchored StartHeight.
+		// With no hot or archived predecessor, bootstrap is intentionally unanchored.
 		i.pendingPeer = peerID
 		i.pending = block
 		return i.withStoreState(result), nil
@@ -233,6 +253,12 @@ func (i *HotIngestor) submit(block *types.Block, peerID PeerID) (IngestResult, e
 	i.pendingPeer = peerID
 	i.pending = block
 	return i.withStoreState(result), nil
+}
+
+func (i *HotIngestor) discardPending() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.pending, i.pendingPeer = nil, ""
 }
 
 func (i *HotIngestor) PendingHeight() int64 {

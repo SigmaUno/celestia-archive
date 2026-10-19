@@ -542,3 +542,44 @@ func TestHotIngestorRestartVerifiesCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHotIngestorArchivePredecessorValidation(t *testing.T) {
+	vals, keys := types.RandValidatorSet(4, 1)
+	tip := makeSignedIngestBlock(t, 5, vals, nil)
+	next := makeSignedIngestBlock(t, 6, vals, makeCommitForBlock(t, tip, vals, keys, ingestTestChainID))
+	for _, scenario := range []string{"valid", "wrong-chain", "wrong-start", "checkpoint", "forged-commit"} {
+		t.Run(scenario, func(t *testing.T) {
+			opts := IngestOptions{ChainID: ingestTestChainID, Predecessor: tip, Validation: ValidationValidatorSet, ValidatorSets: map[int64]*types.ValidatorSet{5: vals, 6: vals}}
+			switch scenario {
+			case "wrong-chain":
+				opts.ChainID = "different-chain"
+			case "wrong-start":
+				opts.StartHeight = 8
+			case "checkpoint":
+				opts.Validation = ValidationCheckpoint
+				opts.Checkpoints = map[int64]string{5: hex.EncodeToString(bytesOf(0x99, 32))}
+			}
+			i, err := NewHotIngestor(newTestBlockStore(t), opts)
+			if scenario == "wrong-chain" || scenario == "wrong-start" || scenario == "checkpoint" {
+				if err == nil {
+					t.Fatal("accepted invalid archive anchor")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "forged-commit" {
+				commit := makeCommitForBlock(t, tip, vals, keys, ingestTestChainID)
+				commit.Signatures[0].Signature[0] ^= 0xff
+				bad := makeSignedIngestBlock(t, 6, vals, commit)
+				if _, err := i.Submit(bad); err == nil {
+					t.Fatal("accepted forged archive boundary commit")
+				}
+			}
+			if _, err := i.Submit(next); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
