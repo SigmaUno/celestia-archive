@@ -235,7 +235,10 @@ func (s *LocalObjectStore) Put(_ context.Context, key string, data []byte) error
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return syncLocalObjectDirectories(filepath.Dir(path))
 }
 
 func (s *LocalObjectStore) PutIfAbsent(_ context.Context, key string, data []byte) error {
@@ -276,11 +279,41 @@ func (s *LocalObjectStore) PutIfAbsent(_ context.Context, key string, data []byt
 	}
 	if err := os.Link(tmpName, path); err != nil {
 		if errors.Is(err, os.ErrExist) {
+			if err := syncLocalObjectDirectories(dir); err != nil {
+				return err
+			}
 			return ErrObjectAlreadyExists
 		}
 		return err
 	}
-	return nil
+	return syncLocalObjectDirectories(dir)
+}
+
+// Sync every ancestor, including existing ones: an earlier failed publication
+// may have left directory entries visible but not durable.
+func syncLocalObjectDirectories(dir string) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	for {
+		if err := syncLocalDirectory(dir); err != nil {
+			return fmt.Errorf("sync local object directory %q: %w", dir, err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		dir = parent
+	}
+}
+
+var syncLocalDirectory = func(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Sync(), f.Close())
 }
 
 func (s *LocalObjectStore) Exists(_ context.Context, key string) (bool, error) {
@@ -300,6 +333,11 @@ func (s *LocalObjectStore) Exists(_ context.Context, key string) (bool, error) {
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return false, fmt.Errorf("local object %q is a symlink", key)
+	}
+	// Archiving reuses existing segments after this check; visibility alone
+	// does not establish durability after a failed publication sync.
+	if err := syncLocalObjectDirectories(filepath.Dir(path)); err != nil {
+		return false, err
 	}
 	return true, nil
 }

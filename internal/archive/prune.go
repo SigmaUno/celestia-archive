@@ -63,7 +63,7 @@ func VerifyArchiveForPrune(ctx context.Context, objectStore ObjectStore, manifes
 	if objectStore == nil {
 		return nil, errors.New("object store is required")
 	}
-	manifest, err := LoadManifest(ctx, objectStore, manifestKey)
+	manifest, err := loadDurableManifest(ctx, objectStore, manifestKey)
 	if err != nil {
 		return nil, fmt.Errorf("verify archive before prune: %w", err)
 	}
