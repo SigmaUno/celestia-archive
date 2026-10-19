@@ -61,9 +61,9 @@ type HydrateOptions struct {
 	StartHeight int64
 	EndHeight   int64
 	MaxBytes    int64
-	// Concurrency bounds the worker pool used to fetch and decode segments in
-	// parallel. Disk writes remain serialized in manifest order so the cache
-	// limit and atomic-rename ordering are preserved. Non-positive values
+	// Concurrency bounds fetched and decoded segments outstanding until written,
+	// including active fetches. Disk writes remain serialized in manifest order
+	// so the cache limit and atomic-rename ordering are preserved. Non-positive values
 	// select a sensible default (min(GOMAXPROCS, 8)).
 	Concurrency int
 }
@@ -133,9 +133,9 @@ func Hydrate(ctx context.Context, store ObjectStore, opts HydrateOptions) (Hydra
 		workers = len(relevant)
 	}
 
-	// Per-slot single-buffered channels preserve manifest order on the writer
-	// side while allowing workers to race ahead within the concurrency bound.
-	results := make([]chan segResult, len(relevant))
+	// A slot is reused only after the ordered writer finishes its segment.
+	window := make(chan struct{}, workers)
+	results := make([]chan segResult, workers)
 	for i := range results {
 		results[i] = make(chan segResult, 1)
 	}
@@ -148,40 +148,46 @@ func Hydrate(ctx context.Context, store ObjectStore, opts HydrateOptions) (Hydra
 	for w := 0; w < workers; w++ {
 		wg.Go(func() {
 			for slot := range jobs {
+				resultCh := results[slot%workers]
 				if err := workerCtx.Err(); err != nil {
-					results[slot] <- segResult{err: err}
+					resultCh <- segResult{err: err}
 					continue
 				}
 				segment := manifest.Segments[relevant[slot]]
 				data, err := store.Get(workerCtx, segment.Key)
 				if err != nil {
-					results[slot] <- segResult{err: err}
+					resultCh <- segResult{err: err}
 					cancel()
 					continue
 				}
 				records, err := DecodeSegment(data, segment)
 				if err != nil {
-					results[slot] <- segResult{err: err}
+					resultCh <- segResult{err: err}
 					cancel()
 					continue
 				}
-				results[slot] <- segResult{records: records}
+				resultCh <- segResult{records: records}
 			}
 		})
 	}
 
 	// Submit jobs in a separate goroutine so the main goroutine can consume
 	// results in order without deadlocking on a full job channel.
-	go func() {
+	wg.Go(func() {
 		defer close(jobs)
 		for slot := range relevant {
+			select {
+			case <-workerCtx.Done():
+				return
+			case window <- struct{}{}:
+			}
 			select {
 			case <-workerCtx.Done():
 				return
 			case jobs <- slot:
 			}
 		}
-	}()
+	})
 
 	// Consume results in manifest order and perform disk writes sequentially so
 	// enforceCacheLimit observes a deterministic on-disk state after every
@@ -192,7 +198,7 @@ func Hydrate(ctx context.Context, store ObjectStore, opts HydrateOptions) (Hydra
 		select {
 		case <-ctx.Done():
 			writeErr = ctx.Err()
-		case res = <-results[slot]:
+		case res = <-results[slot%workers]:
 		}
 		if writeErr != nil {
 			cancel()
@@ -229,19 +235,11 @@ func Hydrate(ctx context.Context, store ObjectStore, opts HydrateOptions) (Hydra
 			cancel()
 			break
 		}
+		<-window
 	}
 
-	// Drain remaining worker results to release goroutines.
 	cancel()
 	wg.Wait()
-	// Drain any pending results that weren't consumed (after early break) so
-	// the buffered sends do not leak.
-	for _, ch := range results {
-		select {
-		case <-ch:
-		default:
-		}
-	}
 
 	if writeErr != nil {
 		return HydrateResult{}, writeErr
