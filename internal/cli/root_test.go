@@ -1221,7 +1221,7 @@ func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringArchiveUpload(t *tes
 
 	submitted := make(chan error, 1)
 	go func() {
-		_, submitErr := ingestor.Submit(makeCLITestBlock(6))
+		_, submitErr := ingestor.Submit(makeCLITestSuccessor(t, ingestor.LoadBlock(5)))
 		submitted <- submitErr
 	}()
 	select {
@@ -1313,7 +1313,7 @@ func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringPruneVerify(t *testi
 
 	submitted := make(chan error, 1)
 	go func() {
-		_, submitErr := ingestor.Submit(makeCLITestBlock(6))
+		_, submitErr := ingestor.Submit(makeCLITestSuccessor(t, ingestor.LoadBlock(5)))
 		submitted <- submitErr
 	}()
 	select {
@@ -2122,6 +2122,19 @@ func createCLIBlockStoreFixture(t *testing.T, dir string, heights int) {
 		seen := &ctypes.Commit{Height: h, Signatures: []ctypes.CommitSig{}}
 		bs.SaveBlock(block, parts, seen)
 	}
+}
+
+func makeCLITestSuccessor(t *testing.T, previous *ctypes.Block) *ctypes.Block {
+	t.Helper()
+	parts, err := previous.MakePartSet(ctypes.BlockPartSizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := makeCLITestBlock(previous.Height + 1)
+	block.LastBlockID = ctypes.BlockID{Hash: previous.Hash(), PartSetHeader: parts.Header()}
+	block.LastCommit = &ctypes.Commit{Height: previous.Height, BlockID: block.LastBlockID}
+	block.LastCommitHash = block.LastCommit.Hash()
+	return block
 }
 
 func makeCLITestBlock(height int64) *ctypes.Block {

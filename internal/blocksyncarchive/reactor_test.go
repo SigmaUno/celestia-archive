@@ -1,8 +1,11 @@
 package blocksyncarchive
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -1254,3 +1257,180 @@ func (*fakePeer) Set(string, any)        {}
 func (*fakePeer) Get(string) any         { return nil }
 func (*fakePeer) SetRemovalFailed()      {}
 func (*fakePeer) GetRemovalFailed() bool { return false }
+
+func receiveTestBlock(t *testing.T, r *Reactor, peer p2p.Peer, block *types.Block) {
+	t.Helper()
+	pb, err := block.ToProto()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Receive(p2p.Envelope{Src: peer, ChannelID: cmtblocksync.BlocksyncChannel, Message: &bcproto.BlockResponse{Block: pb}})
+}
+
+func TestReactorRecoversDisputedPending(t *testing.T) {
+	for _, mode := range []ValidationMode{ValidationStorageOnly, ValidationCheckpoint, ValidationValidatorSet} {
+		for _, start := range []int64{1, 2} {
+			t.Run(string(mode)+fmt.Sprint(start), func(t *testing.T) {
+				vals, keys := types.RandValidatorSet(4, 1)
+				blocks := make([]*types.Block, 4)
+				var commit *types.Commit
+				for h := int64(1); h <= 3; h++ {
+					blocks[h] = makeSignedIngestBlock(t, h, vals, commit)
+					commit = makeCommitForBlock(t, blocks[h], vals, keys, ingestTestChainID)
+				}
+				bs := newTestBlockStore(t)
+				i, err := NewHotIngestor(bs, IngestOptions{
+					ChainID: ingestTestChainID, Validation: mode,
+					Checkpoints:   map[int64]string{3: hex.EncodeToString(blocks[3].Hash())},
+					ValidatorSets: map[int64]*types.ValidatorSet{1: vals, 2: vals, 3: vals},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if start == 2 {
+					for h := int64(1); h <= 2; h++ {
+						if _, err := i.Submit(blocks[h]); err != nil {
+							t.Fatal(err)
+						}
+					}
+					i, err = NewHotIngestor(bs, i.opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				r, err := NewReactor(i, nil, ReactorOptions{RequestLimit: 2})
+				if err != nil {
+					t.Fatal(err)
+				}
+				bad, honest := newFakePeer("a-bad"), newFakePeer("b-honest")
+				r.AddPeer(bad)
+				r.AddPeer(honest)
+				r.handleStatus(bad, &bcproto.StatusResponse{Base: start, Height: start})
+				r.handleStatus(honest, &bcproto.StatusResponse{Base: start, Height: start + 1})
+				poison := makeSignedIngestBlock(t, start, vals, blocks[start].LastCommit)
+				poison.AppHash = bytesOf(0x99, 32)
+				receiveTestBlock(t, r, bad, poison)
+				receiveTestBlock(t, r, honest, blocks[start+1])
+				if i.NextHeight() != start || bs.Height() != start-1 {
+					t.Fatal("dispute changed persisted history or retained pending")
+				}
+				requests := collectRequests(honest.sentEnvelopes())
+				if len(requests) == 0 || requests[len(requests)-1].Height != start {
+					t.Fatalf("no honest refetch: %+v", requests)
+				}
+				receiveTestBlock(t, r, honest, blocks[start])
+				if bs.Height() != start || !bytes.Equal(bs.LoadBlock(start).Hash(), blocks[start].Hash()) {
+					t.Fatal("honest pair failed to recover")
+				}
+				if _, ok := r.planner.peers["b-honest"]; !ok {
+					t.Fatal("honest successor excluded")
+				}
+				if r.BufferedBlockResponses() != 0 {
+					t.Fatal("successor was not drained")
+				}
+			})
+		}
+	}
+}
+
+func TestReactorBoundsDisputedRefetch(t *testing.T) {
+	i, err := NewHotIngestor(newTestBlockStore(t), IngestOptions{ChainID: ingestTestChainID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReactor(i, nil, ReactorOptions{RequestLimit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b, c := newFakePeer("a"), newFakePeer("b"), newFakePeer("c")
+	for _, p := range []*fakePeer{a, b, c} {
+		r.AddPeer(p)
+	}
+	r.handleStatus(a, &bcproto.StatusResponse{Base: 1, Height: 1})
+	r.handleStatus(b, &bcproto.StatusResponse{Base: 2, Height: 2})
+	r.handleStatus(c, &bcproto.StatusResponse{Base: 1, Height: 1})
+	for index, p := range []*fakePeer{a, c} {
+		poison := makeIngestBlock(t, 1)
+		poison.AppHash = bytesOf(byte(index+1), 32)
+		receiveTestBlock(t, r, p, poison)
+		if index == 0 {
+			receiveTestBlock(t, r, b, makeIngestBlock(t, 2))
+		}
+	}
+	before := len(collectRequests(a.sentEnvelopes())) + len(collectRequests(c.sentEnvelopes()))
+	for range 5 {
+		r.RemovePeer(a, nil)
+		r.AddPeer(a)
+		r.handleStatus(a, &bcproto.StatusResponse{Base: 1, Height: 2})
+		r.handleStatus(c, &bcproto.StatusResponse{Base: 1, Height: 1})
+		r.planAndSend()
+	}
+	after := len(collectRequests(a.sentEnvelopes())) + len(collectRequests(c.sentEnvelopes()))
+	if before != 2 || after != before {
+		t.Fatalf("unbounded refetch: before=%d after=%d", before, after)
+	}
+	if i.PendingHeight() != 0 || i.AdvertisedRange() != (PeerRange{}) {
+		t.Fatal("disputed block survived or persisted")
+	}
+	if _, ok := r.planner.peers["b"]; !ok {
+		t.Fatal("honest successor removed")
+	}
+}
+
+type validatorSetSourceFunc func(int64) (*types.ValidatorSet, error)
+
+func (f validatorSetSourceFunc) ValidatorSet(h int64) (*types.ValidatorSet, error) { return f(h) }
+
+func TestReactorRetriesValidationSourceFailure(t *testing.T) {
+	for _, failHeight := range []int64{1, 2} {
+		t.Run(fmt.Sprint(failHeight), func(t *testing.T) {
+			vals, keys := types.RandValidatorSet(4, 1)
+			first := makeSignedIngestBlock(t, 1, vals, nil)
+			second := makeSignedIngestBlock(t, 2, vals, makeCommitForBlock(t, first, vals, keys, ingestTestChainID))
+			unavailable := false
+			i, err := NewHotIngestor(newTestBlockStore(t), IngestOptions{
+				ChainID: ingestTestChainID, Validation: ValidationValidatorSet,
+				ValidatorSetSource: validatorSetSourceFunc(func(h int64) (*types.ValidatorSet, error) {
+					if unavailable && h == failHeight {
+						return nil, errors.New("RPC temporarily unavailable")
+					}
+					return vals, nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := NewReactor(i, nil, ReactorOptions{RequestLimit: 1, RequestTimeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := newFakePeer("honest")
+			r.AddPeer(peer)
+			r.handleStatus(peer, &bcproto.StatusResponse{Base: 1, Height: 2})
+			receiveTestBlock(t, r, peer, first)
+			delete(i.fetchedSets, failHeight)
+			unavailable = true
+			receiveTestBlock(t, r, peer, second)
+			if i.PendingHeight() != 1 || i.AdvertisedRange() != (PeerRange{}) {
+				t.Fatal("source failure discarded or persisted pending")
+			}
+			if len(r.planner.rejected) != 0 || len(r.planner.peers) != 1 {
+				t.Fatal("source failure penalized peer")
+			}
+			before := len(collectRequests(peer.sentEnvelopes()))
+			r.planAndSend()
+			if len(collectRequests(peer.sentEnvelopes())) != before {
+				t.Fatal("source failure retried without delay")
+			}
+			unavailable = false
+			inflight := r.planner.inflight[2]
+			inflight.RequestedAt = time.Now().Add(-2 * time.Second)
+			r.planner.inflight[2] = inflight
+			r.expireRequestsAndPlan()
+			receiveTestBlock(t, r, peer, second)
+			if i.AdvertisedRange().Height != 1 {
+				t.Fatal("did not recover after source returned")
+			}
+		})
+	}
+}

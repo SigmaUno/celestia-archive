@@ -456,20 +456,29 @@ func (r *Reactor) handleBlockResponse(peer p2p.Peer, msg *bcproto.BlockResponse)
 }
 
 func (r *Reactor) submitAndDrainBuffered(peerID PeerID, block *types.Block) bool {
+	r.mu.Lock()
 	for block != nil {
-		if _, err := r.ingestor.Submit(block); err != nil {
-			r.mu.Lock()
+		if _, err := r.ingestor.submit(block, peerID); err != nil {
 			r.planner.MarkFailed(block.Height)
 			delete(r.bufferedResponses, block.Height)
-			if peerID != "" {
-				r.planner.RemovePeer(peerID)
-				r.dropBufferedResponsesFromPeerLocked(peerID)
+			var conflict *pendingConflictError
+			switch {
+			case errors.As(err, &conflict):
+				// Neither side of a conflicting pair proves which provider lied.
+				// Try each pending provider at most once at this height.
+				r.planner.RejectAt(conflict.peerID, conflict.height)
+				r.planner.MarkFailed(conflict.height)
+				r.bufferedResponses[block.Height] = bufferedBlockResponse{peerID: peerID, block: block}
+				r.planner.MarkReceived(block.Height)
+			case errors.Is(err, errValidationSource):
+				r.planner.RetryLater(peerID, block.Height)
+			default:
+				r.planner.RejectAt(peerID, block.Height)
 			}
 			r.mu.Unlock()
 			r.planAndSend()
 			return false
 		}
-		r.mu.Lock()
 		r.planner.MarkDone(block.Height)
 		delete(r.bufferedResponses, block.Height)
 		nextHeight := r.ingestor.NextHeight()
@@ -480,8 +489,8 @@ func (r *Reactor) submitAndDrainBuffered(peerID PeerID, block *types.Block) bool
 		} else {
 			block = nil
 		}
-		r.mu.Unlock()
 	}
+	r.mu.Unlock()
 	return true
 }
 

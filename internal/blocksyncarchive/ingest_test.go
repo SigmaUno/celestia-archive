@@ -322,6 +322,7 @@ func makeSignedIngestBlock(t *testing.T, height int64, vals *types.ValidatorSet,
 		lastCommit = &types.Commit{Height: 0, Signatures: []types.CommitSig{}}
 	}
 	block := types.MakeBlock(height, types.Data{Txs: []types.Tx{types.Tx(fmt.Sprintf("tx-%d", height))}}, lastCommit, nil)
+	block.LastBlockID = lastCommit.BlockID
 	block.ChainID = ingestTestChainID
 	block.ProposerAddress = vals.GetProposer().Address
 	block.ValidatorsHash = vals.Hash()
@@ -394,6 +395,7 @@ func makeIngestBlock(t *testing.T, height int64) *types.Block {
 		lastCommit = &types.Commit{Height: 0, Signatures: []types.CommitSig{}}
 	}
 	block := types.MakeBlock(height, types.Data{Txs: []types.Tx{types.Tx(fmt.Sprintf("tx-%d", height))}}, lastCommit, nil)
+	block.LastBlockID = lastCommit.BlockID
 	block.ChainID = ingestTestChainID
 	block.ProposerAddress = bytesOf(byte(height), crypto.AddressSize)
 	block.ValidatorsHash = bytesOf(0x11, 32)
@@ -417,4 +419,126 @@ func (s *mockValidatorSetSource) ValidatorSet(height int64) (*types.ValidatorSet
 	}
 	s.loads[height]++
 	return s.sets[height], nil
+}
+
+func TestHotIngestorRestartBoundary(t *testing.T) {
+	for _, mutation := range []string{"normal", "divergent", "last-block-id", "commit-id", "commit-height", "part-set"} {
+		t.Run(mutation, func(t *testing.T) {
+			bs := newTestBlockStore(t)
+			ingestor, err := NewHotIngestor(bs, IngestOptions{ChainID: ingestTestChainID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for h := int64(1); h <= 2; h++ {
+				if _, err := ingestor.Submit(makeIngestBlock(t, h)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restarted, err := NewHotIngestor(bs, IngestOptions{ChainID: ingestTestChainID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := makeIngestBlock(t, 2)
+			switch mutation {
+			case "divergent":
+				next.LastBlockID.Hash = bytesOf(0x99, 32)
+				next.LastCommit.BlockID = next.LastBlockID
+			case "last-block-id":
+				next.LastBlockID = types.BlockID{}
+			case "commit-id":
+				next.LastCommit.BlockID = types.BlockID{}
+			case "commit-height":
+				next.LastCommit.Height = 99
+			case "part-set":
+				next.LastBlockID.PartSetHeader.Total++
+				next.LastCommit.BlockID = next.LastBlockID
+			}
+			_, err = restarted.Submit(next)
+			if mutation != "normal" {
+				if err == nil || restarted.PendingHeight() != 0 || bs.Height() != 1 {
+					t.Fatalf("divergent restart accepted: %v", err)
+				}
+				if _, err := restarted.Submit(makeIngestBlock(t, 2)); err != nil {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := restarted.Submit(makeIngestBlock(t, 3)); err != nil {
+				t.Fatal(err)
+			}
+			if bs.Height() != 2 {
+				t.Fatalf("persisted height = %d", bs.Height())
+			}
+			if _, err := NewHotIngestor(bs, IngestOptions{ChainID: "different-chain"}); err == nil {
+				t.Fatal("accepted wrong hot chain")
+			}
+		})
+	}
+}
+
+func TestHotIngestorAdjacentLastBlockID(t *testing.T) {
+	i, err := NewHotIngestor(newTestBlockStore(t), IngestOptions{ChainID: ingestTestChainID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Submit(makeIngestBlock(t, 1)); err != nil {
+		t.Fatal(err)
+	}
+	next := makeIngestBlock(t, 2)
+	next.LastBlockID = types.BlockID{}
+	if _, err := i.Submit(next); err == nil {
+		t.Fatal("accepted inconsistent predecessor IDs")
+	}
+	if i.PendingHeight() != 1 {
+		t.Fatal("unambiguous successor error discarded pending")
+	}
+	if _, err := i.Submit(makeIngestBlock(t, 2)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHotIngestorUnanchoredBootstrap(t *testing.T) {
+	i, err := NewHotIngestor(newTestBlockStore(t), IngestOptions{ChainID: ingestTestChainID, StartHeight: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := int64(10); h <= 11; h++ {
+		if _, err := i.Submit(makeIngestBlock(t, h)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if i.AdvertisedRange() != (PeerRange{Base: 10, Height: 10}) {
+		t.Fatal(i.AdvertisedRange())
+	}
+}
+
+func TestHotIngestorRestartVerifiesCommit(t *testing.T) {
+	bs := newTestBlockStore(t)
+	vals, keys := types.RandValidatorSet(4, 1)
+	first := makeSignedIngestBlock(t, 1, vals, nil)
+	second := makeSignedIngestBlock(t, 2, vals, makeCommitForBlock(t, first, vals, keys, ingestTestChainID))
+	opts := IngestOptions{ChainID: ingestTestChainID, Validation: ValidationValidatorSet, ValidatorSets: map[int64]*types.ValidatorSet{1: vals, 2: vals}}
+	i, err := NewHotIngestor(bs, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []*types.Block{first, second} {
+		if _, err := i.Submit(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	i, err = NewHotIngestor(bs, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badCommit := makeCommitForBlock(t, first, vals, keys, ingestTestChainID)
+	badCommit.Signatures[0].Signature[0] ^= 0xff
+	bad := makeSignedIngestBlock(t, 2, vals, badCommit)
+	if _, err := i.Submit(bad); err == nil {
+		t.Fatal("restart accepted forged commit")
+	}
+	if _, err := i.Submit(second); err != nil {
+		t.Fatal(err)
+	}
 }

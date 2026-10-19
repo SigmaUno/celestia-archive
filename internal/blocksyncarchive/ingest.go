@@ -20,6 +20,18 @@ const (
 	ValidationValidatorSet ValidationMode = "validator-set"
 )
 
+var errValidationSource = errors.New("validation source unavailable")
+var errPredecessorMismatch = errors.New("predecessor mismatch")
+
+type pendingConflictError struct {
+	height int64
+	peerID PeerID
+	err    error
+}
+
+func (e *pendingConflictError) Error() string { return e.err.Error() }
+func (e *pendingConflictError) Unwrap() error { return e.err }
+
 type IngestOptions struct {
 	ChainID            string
 	StartHeight        int64
@@ -57,6 +69,7 @@ type HotIngestor struct {
 	store          *store.BlockStore
 	opts           IngestOptions
 	pending        *types.Block
+	pendingPeer    PeerID
 	fetchedSets    map[int64]*types.ValidatorSet
 	fetchedHeights []int64
 }
@@ -71,6 +84,12 @@ func NewHotIngestor(blockStore *store.BlockStore, opts IngestOptions) (*HotInges
 	}
 	if opts.ChainID == "" {
 		return nil, errors.New("chain ID is required")
+	}
+	if height := blockStore.Height(); height > 0 {
+		tip := blockStore.LoadBlock(height)
+		if tip == nil || tip.ChainID != opts.ChainID {
+			return nil, fmt.Errorf("hot store tip %d does not match chain %q", height, opts.ChainID)
+		}
 	}
 	if opts.StartHeight < 0 {
 		return nil, errors.New("start height cannot be negative")
@@ -177,6 +196,10 @@ func (*HotBlockReader) Close() error {
 }
 
 func (i *HotIngestor) Submit(block *types.Block) (IngestResult, error) {
+	return i.submit(block, "")
+}
+
+func (i *HotIngestor) submit(block *types.Block, peerID PeerID) (IngestResult, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if err := i.validateBlock(block); err != nil {
@@ -188,13 +211,26 @@ func (i *HotIngestor) Submit(block *types.Block) (IngestResult, error) {
 	}
 	result := IngestResult{Accepted: block.Height}
 	if i.pending == nil {
+		if height := i.store.Height(); height > 0 {
+			if _, err := i.validatePredecessor(i.store.LoadBlock(height), block); err != nil {
+				return IngestResult{}, err
+			}
+		}
+		// An empty store intentionally permits an unanchored StartHeight.
+		i.pendingPeer = peerID
 		i.pending = block
 		return i.withStoreState(result), nil
 	}
 	if err := i.persistPending(block); err != nil {
+		if errors.Is(err, errPredecessorMismatch) {
+			conflict := &pendingConflictError{height: i.pending.Height, peerID: i.pendingPeer, err: err}
+			i.pending, i.pendingPeer = nil, ""
+			return IngestResult{}, conflict
+		}
 		return IngestResult{}, err
 	}
 	result.Persisted = i.pending.Height
+	i.pendingPeer = peerID
 	i.pending = block
 	return i.withStoreState(result), nil
 }
@@ -266,38 +302,39 @@ func normalizeCheckpoints(checkpoints map[int64]string) (map[int64]string, error
 }
 
 func (i *HotIngestor) persistPending(next *types.Block) error {
-	if next.LastCommit == nil {
-		return fmt.Errorf("block %d cannot commit pending block %d: nil last commit", next.Height, i.pending.Height)
-	}
-	if next.LastCommit.Height != i.pending.Height {
-		return fmt.Errorf("block %d last commit height %d, expected %d", next.Height, next.LastCommit.Height, i.pending.Height)
-	}
-	parts, err := i.pending.MakePartSet(types.BlockPartSizeBytes)
+	parts, err := i.validatePredecessor(i.pending, next)
 	if err != nil {
-		return fmt.Errorf("make part set for block %d: %w", i.pending.Height, err)
-	}
-	if !bytes.Equal(next.LastCommit.BlockID.Hash, i.pending.Hash()) {
-		return fmt.Errorf("block %d last commit does not reference pending block %d", next.Height, i.pending.Height)
-	}
-	if next.LastCommit.BlockID.PartSetHeader.Total != parts.Header().Total ||
-		!bytes.Equal(next.LastCommit.BlockID.PartSetHeader.Hash, parts.Header().Hash) {
-		return fmt.Errorf("block %d last commit part set does not reference pending block %d", next.Height, i.pending.Height)
-	}
-	if i.opts.Validation == ValidationValidatorSet {
-		vals, err := i.validatorSetFor(i.pending.Height)
-		if err != nil {
-			return err
-		}
-		if vals == nil {
-			return fmt.Errorf("missing validator set for committed height %d", i.pending.Height)
-		}
-		blockID := types.BlockID{Hash: i.pending.Hash(), PartSetHeader: parts.Header()}
-		if err := vals.VerifyCommit(i.opts.ChainID, blockID, i.pending.Height, next.LastCommit); err != nil {
-			return fmt.Errorf("verify commit for block %d: %w", i.pending.Height, err)
-		}
+		return err
 	}
 	i.store.SaveBlock(i.pending, parts, next.LastCommit)
 	return nil
+}
+
+func (i *HotIngestor) validatePredecessor(previous, next *types.Block) (*types.PartSet, error) {
+	if next.LastCommit == nil || next.LastCommit.Height != previous.Height {
+		return nil, fmt.Errorf("block %d must commit height %d", next.Height, previous.Height)
+	}
+	if !next.LastBlockID.Equals(next.LastCommit.BlockID) {
+		return nil, fmt.Errorf("block %d last block ID differs from last commit", next.Height)
+	}
+	parts, err := previous.MakePartSet(types.BlockPartSizeBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: make part set for block %d: %v", errValidationSource, previous.Height, err)
+	}
+	blockID := types.BlockID{Hash: previous.Hash(), PartSetHeader: parts.Header()}
+	if !next.LastBlockID.Equals(blockID) {
+		return nil, fmt.Errorf("%w: block %d does not reference block %d", errPredecessorMismatch, next.Height, previous.Height)
+	}
+	if i.opts.Validation == ValidationValidatorSet {
+		vals, err := i.validatorSetFor(previous.Height)
+		if err != nil {
+			return nil, err
+		}
+		if err := vals.VerifyCommit(i.opts.ChainID, blockID, previous.Height, next.LastCommit); err != nil {
+			return nil, fmt.Errorf("verify commit for block %d: %w", previous.Height, err)
+		}
+	}
+	return parts, nil
 }
 
 func (i *HotIngestor) validatorSetFor(height int64) (*types.ValidatorSet, error) {
@@ -308,17 +345,17 @@ func (i *HotIngestor) validatorSetFor(height int64) (*types.ValidatorSet, error)
 		return vals, nil
 	}
 	if i.opts.ValidatorSetSource == nil {
-		return nil, fmt.Errorf("missing validator set for height %d", height)
+		return nil, fmt.Errorf("%w: missing validator set for height %d", errValidationSource, height)
 	}
 	vals, err := i.opts.ValidatorSetSource.ValidatorSet(height)
 	if err != nil {
-		return nil, fmt.Errorf("load validator set for height %d: %w", height, err)
+		return nil, fmt.Errorf("%w: load validator set for height %d: %w", errValidationSource, height, err)
 	}
 	if vals == nil {
-		return nil, fmt.Errorf("validator set source returned nil for height %d", height)
+		return nil, fmt.Errorf("%w: validator set source returned nil for height %d", errValidationSource, height)
 	}
 	if err := vals.ValidateBasic(); err != nil {
-		return nil, fmt.Errorf("validator set from source at height %d: %w", height, err)
+		return nil, fmt.Errorf("%w: validator set from source at height %d: %w", errValidationSource, height, err)
 	}
 	if i.fetchedSets == nil {
 		i.fetchedSets = make(map[int64]*types.ValidatorSet)

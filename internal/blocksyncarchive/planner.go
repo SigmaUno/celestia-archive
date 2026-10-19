@@ -42,6 +42,7 @@ type RequestPlanner struct {
 	received map[int64]struct{}
 	noBlocks map[PeerID]map[int64]struct{}
 	timeouts map[PeerID]map[int64]struct{}
+	rejected map[PeerID]map[int64]struct{}
 }
 
 type inflightRequest struct {
@@ -56,6 +57,7 @@ func NewRequestPlanner() *RequestPlanner {
 		received: make(map[int64]struct{}),
 		noBlocks: make(map[PeerID]map[int64]struct{}),
 		timeouts: make(map[PeerID]map[int64]struct{}),
+		rejected: make(map[PeerID]map[int64]struct{}),
 	}
 }
 
@@ -98,6 +100,21 @@ func (p *RequestPlanner) MarkDone(height int64) {
 func (p *RequestPlanner) MarkFailed(height int64) {
 	delete(p.inflight, height)
 	delete(p.received, height)
+}
+
+func (p *RequestPlanner) RejectAt(id PeerID, height int64) {
+	if id == "" {
+		return
+	}
+	if p.rejected[id] == nil {
+		p.rejected[id] = make(map[int64]struct{})
+	}
+	p.rejected[id][height] = struct{}{}
+}
+
+func (p *RequestPlanner) RetryLater(id PeerID, height int64) {
+	p.MarkFailed(height)
+	p.inflight[height] = inflightRequest{PeerID: id, RequestedAt: time.Now()}
 }
 
 func (p *RequestPlanner) MarkReceived(height int64) {
@@ -172,6 +189,13 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 		return nil, errors.New("next height must be positive")
 	}
 	p.pruneMarkersBelow(nextHeight)
+	// Pending height may be refetched until its successor persists it.
+	for id, heights := range p.rejected {
+		pruneHeightSet(heights, nextHeight-1)
+		if len(heights) == 0 {
+			delete(p.rejected, id)
+		}
+	}
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -247,12 +271,18 @@ func (p *RequestPlanner) peerForHeight(height int64) (PeerID, bool) {
 	slices.Sort(ids)
 	for _, id := range ids {
 		peerID := PeerID(id)
+		if _, rejected := p.rejected[peerID][height]; rejected {
+			continue
+		}
 		if p.peers[peerID].Contains(height) && !p.peerReturnedNoBlock(peerID, height) && !p.peerTimedOut(peerID, height) {
 			return peerID, true
 		}
 	}
 	for _, id := range ids {
 		peerID := PeerID(id)
+		if _, rejected := p.rejected[peerID][height]; rejected {
+			continue
+		}
 		if p.peers[peerID].Contains(height) && !p.peerReturnedNoBlock(peerID, height) {
 			return peerID, true
 		}
