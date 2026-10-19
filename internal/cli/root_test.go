@@ -76,16 +76,109 @@ func TestHelpIncludesRequiredCommands(t *testing.T) {
 	}
 }
 
-func TestLiveIngestStartHeightUsesArchiveWhenHotStoreIsEmpty(t *testing.T) {
-	start := liveIngestStartHeight(staticHeightReader{height: 0}, archive.InspectSummary{LastHeight: 42})
-	if start != 43 {
-		t.Fatalf("start height %d, want 43", start)
+func TestLiveIngestPredecessor(t *testing.T) {
+	ctx := context.Background()
+	objects, err := archive.NewLocalObjectStore(filepath.Join(t.TempDir(), "objects"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if start := liveIngestStartHeight(staticHeightReader{height: 40}, archive.InspectSummary{LastHeight: 42}); start != 0 {
-		t.Fatalf("non-empty hot store start height %d, want default 0", start)
+	tip := makeCLITestBlock(4)
+	record, err := archive.BlockToRecord(tip)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if start := liveIngestStartHeight(staticHeightReader{height: 0}, archive.InspectSummary{}); start != 0 {
-		t.Fatalf("empty archive start height %d, want default 0", start)
+	data, segment, err := archive.EncodeSegment([]archive.BlockRecord{record}, archive.CompressionGzip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment.Key = archive.SegmentKey("archive", cliTestChainID, segment)
+	if err := objects.Put(ctx, segment.Key, data); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := archive.NewManifest(cliTestChainID, []archive.SegmentManifest{segment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := archive.ManifestKey("archive", cliTestChainID, archive.DefaultManifest)
+	if err := archive.SaveManifest(ctx, objects, key, manifest); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := archive.Inspect(ctx, objects, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := blocksyncarchive.NewArchiveBlockSource(objects, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"resume", "fresh", "hot", "wrong-chain", "missing-tip", "corrupt-tip"} {
+		t.Run(scenario, func(t *testing.T) {
+			gotSummary := summary
+			height := int64(0)
+			switch scenario {
+			case "fresh":
+				gotSummary = archive.InspectSummary{}
+			case "hot":
+				height = 4
+			case "wrong-chain":
+				gotSummary.ChainID = "other"
+			case "missing-tip":
+				gotSummary.LastHeight = 5
+			case "corrupt-tip":
+				if err := objects.Put(ctx, segment.Key, []byte("corrupt")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			predecessor, err := liveIngestPredecessor(ctx, staticHeightReader{height: height}, gotSummary, source, cliTestChainID)
+			if scenario == "wrong-chain" || scenario == "missing-tip" || scenario == "corrupt-tip" {
+				if err == nil {
+					t.Fatal("accepted unusable archive tip")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "resume" {
+				if predecessor != nil {
+					t.Fatal("unexpected archive predecessor")
+				}
+				return
+			}
+			if predecessor == nil || !bytes.Equal(predecessor.Hash(), tip.Hash()) {
+				t.Fatal("archive tip not loaded")
+			}
+			dbDir := filepath.Join(t.TempDir(), "db")
+			createCLIBlockStoreFixture(t, dbDir, 0)
+			bs, err := archive.OpenCometBlockStore(dbDir, "goleveldb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer bs.Close()
+			i, err := blocksyncarchive.NewHotIngestor(bs, blocksyncarchive.IngestOptions{ChainID: cliTestChainID, Predecessor: predecessor})
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := makeCLITestSuccessor(t, tip)
+			bad := makeCLITestSuccessor(t, tip)
+			bad.LastBlockID.Hash = testBytes(0x99, 32)
+			bad.LastCommit.BlockID = bad.LastBlockID
+			if _, err := i.Submit(bad); err == nil {
+				t.Fatal("accepted divergent archive resume")
+			}
+			if i.NextHeight() != 5 || i.PendingHeight() != 0 || bs.Height() != 0 {
+				t.Fatal("rejection mutated history")
+			}
+			if _, err := i.Submit(next); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := i.Submit(makeCLITestSuccessor(t, next)); err != nil {
+				t.Fatal(err)
+			}
+			if bs.Base() != 5 || bs.Height() != 5 {
+				t.Fatal("archive predecessor was persisted into hot history")
+			}
+		})
 	}
 }
 
@@ -1312,7 +1405,7 @@ func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringArchiveUpload(t *tes
 
 	submitted := make(chan error, 1)
 	go func() {
-		_, submitErr := ingestor.Submit(makeCLITestBlock(6))
+		_, submitErr := ingestor.Submit(makeCLITestSuccessor(t, ingestor.LoadBlock(5)))
 		submitted <- submitErr
 	}()
 	select {
@@ -1404,7 +1497,7 @@ func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringPruneVerify(t *testi
 
 	submitted := make(chan error, 1)
 	go func() {
-		_, submitErr := ingestor.Submit(makeCLITestBlock(6))
+		_, submitErr := ingestor.Submit(makeCLITestSuccessor(t, ingestor.LoadBlock(5)))
 		submitted <- submitErr
 	}()
 	select {
@@ -2213,6 +2306,19 @@ func createCLIBlockStoreFixture(t *testing.T, dir string, heights int) {
 		seen := &ctypes.Commit{Height: h, Signatures: []ctypes.CommitSig{}}
 		bs.SaveBlock(block, parts, seen)
 	}
+}
+
+func makeCLITestSuccessor(t *testing.T, previous *ctypes.Block) *ctypes.Block {
+	t.Helper()
+	parts, err := previous.MakePartSet(ctypes.BlockPartSizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := makeCLITestBlock(previous.Height + 1)
+	block.LastBlockID = ctypes.BlockID{Hash: previous.Hash(), PartSetHeader: parts.Header()}
+	block.LastCommit = &ctypes.Commit{Height: previous.Height, BlockID: block.LastBlockID}
+	block.LastCommitHash = block.LastCommit.Hash()
+	return block
 }
 
 func makeCLITestBlock(height int64) *ctypes.Block {
