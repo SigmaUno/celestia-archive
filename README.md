@@ -59,6 +59,33 @@ See [docs/serve.config.example.json](docs/serve.config.example.json) for a full
 example. `segment_blocks` defaults to `100`, is capped at `1000`, and encoded
 segment payloads are capped at 1 GiB.
 
+`--p2p-send-rate` / `p2p_send_rate` and `--p2p-recv-rate` / `p2p_recv_rate`
+set positive integer bytes/second limits on each peer connection in the
+CometBFT transport, across all its channels. Both default to `5120000`.
+These are transport rate limits with packet buffering and sampling, not a
+node-wide bandwidth budget or a promised archive ingestion rate. Zero and
+negative values are rejected by the CLI and JSON config. Programmatic
+`NodeOptions` uses zero to select the same default.
+
+Normal ingest requests prioritize the earliest missing height in the bounded
+request window and choose the eligible provider with the fewest outstanding
+network requests (peer ID breaks ties). Each provider is capped at 32 inflight
+requests. Received blocks and delayed local validation retries do not count
+as network load. Timeouts prefer another eligible provider; no-block replies
+and invalid blocks exclude that provider at the affected height. Recovery
+continues to fetch its bounded coherent pair from one provider at a time.
+
+Reproduce the planner distribution measurement with:
+
+```sh
+go test ./internal/blocksyncarchive -run '^$' -bench '^BenchmarkRequestPlannerDistribution$' -benchtime=100x -count=1
+```
+
+This deterministic 32-request window reports 32 requests for one provider or
+8 requests each for four providers, versus the former sorted-first policy's
+32/0/0/0 for four identical providers. It measures request distribution and
+planner CPU cost only; it provides no evidence of a network throughput gain.
+
 ## Other commands
 
 - `prune-hot` enforces local retention only after a full archive

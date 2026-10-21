@@ -930,6 +930,8 @@ func TestServeConfigPopulatesDryRunAndFlagsOverride(t *testing.T) {
   "store": %q,
 	  "chain_id": %q,
 	  "p2p_listen": "tcp://127.0.0.1:26656",
+  "p2p_send_rate": 1234567,
+  "p2p_recv_rate": 7654321,
 	  "moniker": "archive-peer-1",
 	  "request_limit": 5,
 	  "cold_workers": 2,
@@ -955,11 +957,13 @@ func TestServeConfigPopulatesDryRunAndFlagsOverride(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out := execute(t, "serve", "--config", configPath, "--safety-window", "9")
+	out := execute(t, "serve", "--config", configPath, "--safety-window", "9", "--p2p-send-rate", "2345678")
 	for _, want := range []string{
 		`"status": "dry-run"`,
 		`"chain_id": "archive-test-chain"`,
 		`"moniker": "archive-peer-1"`,
+		`"p2p_send_rate": 2345678`,
+		`"p2p_recv_rate": 7654321`,
 		`"archive_interval": "3s"`,
 		`"prune_interval": "0s"`,
 		`"retain_blocks": 42`,
@@ -2344,4 +2348,35 @@ func testBytes(value byte, size int) []byte {
 		bz[i] = value
 	}
 	return bz
+}
+
+func TestServeP2PRateValidation(t *testing.T) {
+	for _, name := range []string{"send", "recv"} {
+		for _, value := range []string{"0", "-1", "9223372036854775808"} {
+			t.Run(name+value, func(t *testing.T) {
+				dir := t.TempDir()
+				storeURL := "file://" + filepath.Join(dir, "objects")
+				args := []string{"serve", "--store", storeURL, "--chain-id", cliTestChainID}
+				out := executeErr(t, append(args, "--p2p-"+name+"-rate="+value)...)
+				if !strings.Contains(out, "must be positive") && !strings.Contains(out, "value out of range") {
+					t.Fatalf("unexpected flag error: %s", out)
+				}
+				path := filepath.Join(dir, "serve.json")
+				cfg := fmt.Sprintf(`{"p2p_%s_rate": %s}`, name, value)
+				if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				out = executeErr(t, append(args, "--config", path)...)
+				if !strings.Contains(out, "must be positive") && !strings.Contains(out, "cannot unmarshal number") {
+					t.Fatalf("unexpected JSON error: %s", out)
+				}
+			})
+		}
+	}
+	out := execute(t, "serve", "--store", "file://"+filepath.Join(t.TempDir(), "objects"), "--chain-id", cliTestChainID)
+	for _, want := range []string{`"p2p_send_rate": 5120000`, `"p2p_recv_rate": 5120000`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing default %s: %s", want, out)
+		}
+	}
 }

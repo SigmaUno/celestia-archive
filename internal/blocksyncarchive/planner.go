@@ -15,6 +15,8 @@ var (
 
 type PeerID string
 
+const MaxInflightPerPeer = 32
+
 type PeerRange struct {
 	Base   int64
 	Height int64
@@ -274,6 +276,12 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 	}
 
 	requests := make([]Request, 0, limit)
+	loads := make(map[PeerID]int, len(p.peers))
+	for _, request := range p.inflight {
+		if !request.LocalRetry {
+			loads[request.PeerID]++
+		}
+	}
 	windowEnd := nextHeight + int64(limit) - 1
 	if windowEnd < nextHeight {
 		windowEnd = best
@@ -287,7 +295,7 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 		}
 		peerID, ok := p.recoveryPeer, p.recoveryPeer != ""
 		if !ok {
-			peerID, ok = p.peerForHeight(height)
+			peerID, ok = p.peerForHeight(height, loads)
 		}
 		if !ok {
 			if len(requests) == 0 {
@@ -295,7 +303,11 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 			}
 			return requests, nil
 		}
+		if p.recoveryPeer == "" && loads[peerID] >= MaxInflightPerPeer {
+			return requests, nil
+		}
 		p.inflight[height] = inflightRequest{PeerID: peerID, RequestedAt: now}
+		loads[peerID]++
 		requests = append(requests, Request{PeerID: peerID, Height: height})
 	}
 	return requests, nil
@@ -329,28 +341,22 @@ func pruneHeightSet(heights map[int64]struct{}, below int64) {
 	}
 }
 
-func (p *RequestPlanner) peerForHeight(height int64) (PeerID, bool) {
-	ids := make([]string, 0, len(p.peers))
-	for id := range p.peers {
-		ids = append(ids, string(id))
-	}
-	slices.Sort(ids)
-	for _, id := range ids {
-		peerID := PeerID(id)
-		if _, rejected := p.rejected[peerID][height]; rejected {
-			continue
+func (p *RequestPlanner) peerForHeight(height int64, loads map[PeerID]int) (PeerID, bool) {
+	for _, allowTimeout := range []bool{false, true} {
+		var best PeerID
+		for id, advertised := range p.peers {
+			if _, rejected := p.rejected[id][height]; rejected {
+				continue
+			}
+			if !advertised.Contains(height) || p.peerReturnedNoBlock(id, height) || (!allowTimeout && p.peerTimedOut(id, height)) {
+				continue
+			}
+			if best == "" || loads[id] < loads[best] || (loads[id] == loads[best] && id < best) {
+				best = id
+			}
 		}
-		if p.peers[peerID].Contains(height) && !p.peerReturnedNoBlock(peerID, height) && !p.peerTimedOut(peerID, height) {
-			return peerID, true
-		}
-	}
-	for _, id := range ids {
-		peerID := PeerID(id)
-		if _, rejected := p.rejected[peerID][height]; rejected {
-			continue
-		}
-		if p.peers[peerID].Contains(height) && !p.peerReturnedNoBlock(peerID, height) {
-			return peerID, true
+		if best != "" {
+			return best, true
 		}
 	}
 	return "", false
