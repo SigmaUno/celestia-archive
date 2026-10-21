@@ -1511,3 +1511,37 @@ func TestReactorPairRecoveryFailsOverOnUnavailableSource(t *testing.T) {
 		})
 	}
 }
+
+func TestReactorSharesNormalRequestsAndFailsOver(t *testing.T) {
+	i, err := NewHotIngestor(newTestBlockStore(t), IngestOptions{ChainID: ingestTestChainID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReactor(i, nil, ReactorOptions{RequestLimit: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := newFakePeer("a"), newFakePeer("b")
+	for _, peer := range []*fakePeer{a, b} {
+		r.AddPeer(peer)
+		if err := r.planner.UpsertPeer(PeerID(peer.ID()), PeerRange{Base: 1, Height: 4}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.planAndSend()
+	for _, peer := range []*fakePeer{a, b} {
+		if requests := collectRequests(peer.sentEnvelopes()); len(requests) != 2 {
+			t.Fatalf("peer %s got %+v", peer.ID(), requests)
+		}
+	}
+	r.Receive(p2p.Envelope{Src: a, ChannelID: cmtblocksync.BlocksyncChannel, Message: &bcproto.NoBlockResponse{Height: 1}})
+	requests := collectRequests(b.sentEnvelopes())
+	if len(requests) != 3 || requests[2].Height != 1 {
+		t.Fatalf("gap did not fail over: %+v", requests)
+	}
+	receiveTestBlock(t, r, b, makeIngestBlock(t, 2))
+	receiveTestBlock(t, r, b, makeIngestBlock(t, 1))
+	if i.AdvertisedRange().Height != 1 || r.planner.recoveryHeight != 0 {
+		t.Fatal("normal failover did not ingest buffered successor")
+	}
+}

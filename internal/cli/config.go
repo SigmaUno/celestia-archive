@@ -19,6 +19,8 @@ type serveConfig struct {
 	ManifestKey            string   `json:"manifest_key"`
 	DBDir                  string   `json:"db_dir"`
 	DBBackend              string   `json:"db_backend"`
+	P2PSendRate            *int64   `json:"p2p_send_rate"`
+	P2PRecvRate            *int64   `json:"p2p_recv_rate"`
 	P2PListen              string   `json:"p2p_listen"`
 	Moniker                string   `json:"moniker"`
 	NodeKeyFile            string   `json:"node_key_file"`
@@ -56,6 +58,8 @@ type serveSettings struct {
 	dbDir                *string
 	dbBackend            *string
 	listenAddress        *string
+	p2pSendRate          *int64
+	p2pRecvRate          *int64
 	moniker              *string
 	nodeKeyFile          *string
 	persistentPeers      *string
@@ -115,6 +119,8 @@ func applyServeConfig(cmd *cobra.Command, path string, settings serveSettings) e
 	overlayString(cmd, "manifest-key", cfg.ManifestKey, &settings.common.manifestKey)
 	overlayString(cmd, "db-dir", cfg.DBDir, settings.dbDir)
 	overlayString(cmd, "db-backend", cfg.DBBackend, settings.dbBackend)
+	overlayPtr(cmd, "p2p-send-rate", cfg.P2PSendRate, settings.p2pSendRate)
+	overlayPtr(cmd, "p2p-recv-rate", cfg.P2PRecvRate, settings.p2pRecvRate)
 	overlayString(cmd, "p2p-listen", cfg.P2PListen, settings.listenAddress)
 	overlayString(cmd, "moniker", cfg.Moniker, settings.moniker)
 	overlayString(cmd, "node-key-file", cfg.NodeKeyFile, settings.nodeKeyFile)

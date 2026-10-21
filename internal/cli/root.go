@@ -476,7 +476,7 @@ func newServeCommand() (*cobra.Command, error) {
 	var configPath string
 	var validationMode, validatorSetRPC string
 	var checkpointValues, validatorSetValues []string
-	var safetyWindow, retainBlocks, evidenceBlocks int64
+	var safetyWindow, retainBlocks, evidenceBlocks, p2pSendRate, p2pRecvRate int64
 	var archiveInterval, pruneInterval, evidenceDuration, requestTimeout, coldManifestCacheTTL, validatorSetTimeout time.Duration
 	var segmentBlocks, requestLimit, coldWorkers int
 	var statusRequestInterval time.Duration
@@ -490,6 +490,8 @@ func newServeCommand() (*cobra.Command, error) {
 				dbDir:                &dbDir,
 				dbBackend:            &backend,
 				listenAddress:        &listenAddress,
+				p2pSendRate:          &p2pSendRate,
+				p2pRecvRate:          &p2pRecvRate,
 				moniker:              &moniker,
 				nodeKeyFile:          &nodeKeyFile,
 				persistentPeers:      &persistentPeers,
@@ -539,6 +541,8 @@ func newServeCommand() (*cobra.Command, error) {
 				return errors.New("PEX requires at least one seed or an address book file")
 			}
 			if err := validateServeRuntimeConfig(serveRuntimeConfig{
+				p2pSendRate:           p2pSendRate,
+				p2pRecvRate:           p2pRecvRate,
 				requestLimit:          requestLimit,
 				coldWorkers:           coldWorkers,
 				coldManifestCacheTTL:  coldManifestCacheTTL,
@@ -636,6 +640,8 @@ func newServeCommand() (*cobra.Command, error) {
 				node, err := blocksyncarchive.NewArchiveNode(ingestor, nil, blocksyncarchive.NodeOptions{
 					ChainID:         flags.chainID,
 					ListenAddress:   listenAddress,
+					SendRate:        p2pSendRate,
+					RecvRate:        p2pRecvRate,
 					Moniker:         moniker,
 					NodeKeyFile:     nodeKeyFile,
 					PersistentPeers: splitCSV(persistentPeers),
@@ -727,6 +733,8 @@ func newServeCommand() (*cobra.Command, error) {
 					"pex":                     pexEnabled,
 					"addr_book_file":          addrBookFile,
 					"seeds":                   splitCSV(seeds),
+					"p2p_send_rate":           p2pSendRate,
+					"p2p_recv_rate":           p2pRecvRate,
 					"request_limit":           requestLimit,
 					"cold_workers":            resolvedColdWorkers(requestLimit, coldWorkers),
 					"cold_manifest_cache_ttl": coldManifestCacheTTL.String(),
@@ -768,6 +776,8 @@ func newServeCommand() (*cobra.Command, error) {
 				"pex":                     pexEnabled,
 				"addr_book_file":          addrBookFile,
 				"seeds":                   splitCSV(seeds),
+				"p2p_send_rate":           p2pSendRate,
+				"p2p_recv_rate":           p2pRecvRate,
 				"request_limit":           requestLimit,
 				"cold_workers":            resolvedColdWorkers(requestLimit, coldWorkers),
 				"cold_manifest_cache_ttl": coldManifestCacheTTL.String(),
@@ -799,6 +809,8 @@ func newServeCommand() (*cobra.Command, error) {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Describe the live archive node without starting P2P")
 	cmd.Flags().StringVar(&dbDir, "db-dir", "", "CometBFT DB directory containing blockstore.db")
 	cmd.Flags().StringVar(&backend, "db-backend", "goleveldb", "CometBFT DB backend")
+	cmd.Flags().Int64Var(&p2pSendRate, "p2p-send-rate", blocksyncarchive.DefaultP2PRate, "Per-peer P2P send rate in bytes/second (positive)")
+	cmd.Flags().Int64Var(&p2pRecvRate, "p2p-recv-rate", blocksyncarchive.DefaultP2PRate, "Per-peer P2P receive rate in bytes/second (positive)")
 	cmd.Flags().StringVar(&listenAddress, "p2p-listen", "tcp://0.0.0.0:26656", "P2P listen address")
 	cmd.Flags().StringVar(&moniker, "moniker", "cometbft-archive", "P2P node moniker advertised in node info")
 	cmd.Flags().StringVar(&nodeKeyFile, "node-key-file", "", "Path to node_key.json; required when dry-run=false")
@@ -1130,6 +1142,8 @@ func validationTrustModel(validationMode string, checkpointValues, validatorSetV
 }
 
 type serveRuntimeConfig struct {
+	p2pSendRate           int64
+	p2pRecvRate           int64
 	requestLimit          int
 	coldWorkers           int
 	coldManifestCacheTTL  time.Duration
@@ -1146,6 +1160,9 @@ type serveRuntimeConfig struct {
 }
 
 func validateServeRuntimeConfig(c serveRuntimeConfig) error {
+	if c.p2pSendRate <= 0 || c.p2pRecvRate <= 0 {
+		return errors.New("P2P send and receive rates must be positive")
+	}
 	if c.requestLimit <= 0 {
 		return errors.New("request limit must be positive")
 	}

@@ -16,8 +16,12 @@ import (
 	"github.com/cometbft/cometbft/version"
 )
 
+const DefaultP2PRate int64 = 5_120_000
+
 type NodeOptions struct {
 	ChainID         string
+	SendRate        int64
+	RecvRate        int64
 	ListenAddress   string
 	Moniker         string
 	NodeKeyFile     string
@@ -50,6 +54,15 @@ type ArchiveNode struct {
 func NewArchiveNode(ingestor *HotIngestor, planner *RequestPlanner, opts NodeOptions) (*ArchiveNode, error) {
 	if opts.ChainID == "" {
 		return nil, errors.New("chain ID is required")
+	}
+	if opts.SendRate < 0 || opts.RecvRate < 0 {
+		return nil, errors.New("P2P send and receive rates cannot be negative")
+	}
+	if opts.SendRate == 0 {
+		opts.SendRate = DefaultP2PRate
+	}
+	if opts.RecvRate == 0 {
+		opts.RecvRate = DefaultP2PRate
 	}
 	if opts.ListenAddress == "" {
 		opts.ListenAddress = "tcp://0.0.0.0:26656"
@@ -94,6 +107,8 @@ func NewArchiveNode(ingestor *HotIngestor, planner *RequestPlanner, opts NodeOpt
 		return nil, fmt.Errorf("validate node info: %w", validateErr)
 	}
 	cfg := cmtcfg.DefaultP2PConfig()
+	cfg.SendRate = opts.SendRate
+	cfg.RecvRate = opts.RecvRate
 	cfg.ListenAddress = opts.ListenAddress
 	cfg.PexReactor = opts.PEX
 	cfg.AddrBook = opts.AddrBookFile
