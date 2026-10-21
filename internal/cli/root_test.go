@@ -107,12 +107,13 @@ func TestLiveIngestPredecessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := blocksyncarchive.NewArchiveBlockSource(objects, key)
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, scenario := range []string{"resume", "fresh", "hot", "wrong-chain", "missing-tip", "corrupt-tip"} {
 		t.Run(scenario, func(t *testing.T) {
+			source, err := blocksyncarchive.NewArchiveBlockSource(objects, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = source.Close() })
 			gotSummary := summary
 			height := int64(0)
 			switch scenario {
