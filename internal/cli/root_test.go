@@ -76,16 +76,110 @@ func TestHelpIncludesRequiredCommands(t *testing.T) {
 	}
 }
 
-func TestLiveIngestStartHeightUsesArchiveWhenHotStoreIsEmpty(t *testing.T) {
-	start := liveIngestStartHeight(staticHeightReader{height: 0}, archive.InspectSummary{LastHeight: 42})
-	if start != 43 {
-		t.Fatalf("start height %d, want 43", start)
+func TestLiveIngestPredecessor(t *testing.T) {
+	ctx := context.Background()
+	objects, err := archive.NewLocalObjectStore(filepath.Join(t.TempDir(), "objects"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if start := liveIngestStartHeight(staticHeightReader{height: 40}, archive.InspectSummary{LastHeight: 42}); start != 0 {
-		t.Fatalf("non-empty hot store start height %d, want default 0", start)
+	tip := makeCLITestBlock(4)
+	record, err := archive.BlockToRecord(tip)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if start := liveIngestStartHeight(staticHeightReader{height: 0}, archive.InspectSummary{}); start != 0 {
-		t.Fatalf("empty archive start height %d, want default 0", start)
+	data, segment, err := archive.EncodeSegment([]archive.BlockRecord{record}, archive.CompressionGzip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment.Key = archive.SegmentKey("archive", cliTestChainID, segment)
+	if err := objects.Put(ctx, segment.Key, data); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := archive.NewManifest(cliTestChainID, []archive.SegmentManifest{segment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := archive.ManifestKey("archive", cliTestChainID, archive.DefaultManifest)
+	if err := archive.SaveManifest(ctx, objects, key, manifest); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := archive.Inspect(ctx, objects, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"resume", "fresh", "hot", "wrong-chain", "missing-tip", "corrupt-tip"} {
+		t.Run(scenario, func(t *testing.T) {
+			source, err := blocksyncarchive.NewArchiveBlockSource(objects, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = source.Close() })
+			gotSummary := summary
+			height := int64(0)
+			switch scenario {
+			case "fresh":
+				gotSummary = archive.InspectSummary{}
+			case "hot":
+				height = 4
+			case "wrong-chain":
+				gotSummary.ChainID = "other"
+			case "missing-tip":
+				gotSummary.LastHeight = 5
+			case "corrupt-tip":
+				if err := objects.Put(ctx, segment.Key, []byte("corrupt")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			predecessor, err := liveIngestPredecessor(ctx, staticHeightReader{height: height}, gotSummary, source, cliTestChainID)
+			if scenario == "wrong-chain" || scenario == "missing-tip" || scenario == "corrupt-tip" {
+				if err == nil {
+					t.Fatal("accepted unusable archive tip")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "resume" {
+				if predecessor != nil {
+					t.Fatal("unexpected archive predecessor")
+				}
+				return
+			}
+			if predecessor == nil || !bytes.Equal(predecessor.Hash(), tip.Hash()) {
+				t.Fatal("archive tip not loaded")
+			}
+			dbDir := filepath.Join(t.TempDir(), "db")
+			createCLIBlockStoreFixture(t, dbDir, 0)
+			bs, err := archive.OpenCometBlockStore(dbDir, "goleveldb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer bs.Close()
+			i, err := blocksyncarchive.NewHotIngestor(bs, blocksyncarchive.IngestOptions{ChainID: cliTestChainID, Predecessor: predecessor})
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := makeCLITestSuccessor(t, tip)
+			bad := makeCLITestSuccessor(t, tip)
+			bad.LastBlockID.Hash = testBytes(0x99, 32)
+			bad.LastCommit.BlockID = bad.LastBlockID
+			if _, err := i.Submit(bad); err == nil {
+				t.Fatal("accepted divergent archive resume")
+			}
+			if i.NextHeight() != 5 || i.PendingHeight() != 0 || bs.Height() != 0 {
+				t.Fatal("rejection mutated history")
+			}
+			if _, err := i.Submit(next); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := i.Submit(makeCLITestSuccessor(t, next)); err != nil {
+				t.Fatal(err)
+			}
+			if bs.Base() != 5 || bs.Height() != 5 {
+				t.Fatal("archive predecessor was persisted into hot history")
+			}
+		})
 	}
 }
 
@@ -837,6 +931,8 @@ func TestServeConfigPopulatesDryRunAndFlagsOverride(t *testing.T) {
   "store": %q,
 	  "chain_id": %q,
 	  "p2p_listen": "tcp://127.0.0.1:26656",
+  "p2p_send_rate": 1234567,
+  "p2p_recv_rate": 7654321,
 	  "moniker": "archive-peer-1",
 	  "request_limit": 5,
 	  "cold_workers": 2,
@@ -862,11 +958,13 @@ func TestServeConfigPopulatesDryRunAndFlagsOverride(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out := execute(t, "serve", "--config", configPath, "--safety-window", "9")
+	out := execute(t, "serve", "--config", configPath, "--safety-window", "9", "--p2p-send-rate", "2345678")
 	for _, want := range []string{
 		`"status": "dry-run"`,
 		`"chain_id": "archive-test-chain"`,
 		`"moniker": "archive-peer-1"`,
+		`"p2p_send_rate": 2345678`,
+		`"p2p_recv_rate": 7654321`,
 		`"archive_interval": "3s"`,
 		`"prune_interval": "0s"`,
 		`"retain_blocks": 42`,
@@ -1124,6 +1222,97 @@ func TestLiveIngestorMaintenanceLoopDoesNotExitOrPruneOnCorruptArchive(t *testin
 	}
 }
 
+func TestLiveMaintenanceRejectsUnrelatedArchive(t *testing.T) {
+	for _, kind := range []string{"partial", "wrong-chain", "divergent"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dbDir := filepath.Join(t.TempDir(), "db")
+			createCLIBlockStoreFixture(t, dbDir, 5)
+			reader, err := archive.OpenCometBlockStore(dbDir, "goleveldb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			ingestor, err := blocksyncarchive.NewHotIngestor(reader, blocksyncarchive.IngestOptions{ChainID: cliTestChainID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			objectStore, err := archive.NewLocalObjectStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			chain := cliTestChainID
+			first := int64(1)
+			if kind == "partial" {
+				first = 3
+			}
+			if kind == "wrong-chain" {
+				chain = "other-chain"
+			}
+			var records []archive.BlockRecord
+			for h := first; h <= 4; h++ {
+				block := makeCLITestBlock(h)
+				block.ChainID = chain
+				if kind == "divergent" && h == 4 {
+					block.AppHash = []byte("divergent")
+				}
+				record, err := archive.BlockToRecord(block)
+				if err != nil {
+					t.Fatal(err)
+				}
+				records = append(records, record)
+			}
+			data, segment, err := archive.EncodeSegment(records, archive.CompressionGzip)
+			if err != nil {
+				t.Fatal(err)
+			}
+			segment.Key = "unrelated-segment"
+			if err := objectStore.Put(ctx, segment.Key, data); err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := archive.NewManifest(chain, []archive.SegmentManifest{segment})
+			if err != nil {
+				t.Fatal(err)
+			}
+			const manifestKey = "unrelated-manifest.json"
+			if err := archive.SaveManifest(ctx, objectStore, manifestKey, manifest); err != nil {
+				t.Fatal(err)
+			}
+			stats := newLiveMaintenanceStats()
+			errCh := startLiveIngestorMaintenanceLoop(ctx, ingestor, objectStore, archive.LiveArchiveOptions{
+				ChainID: cliTestChainID, Prefix: "archive", SegmentBlocks: 2, Compression: archive.CompressionGzip,
+			}, 1, time.Hour, archive.PruneHotOptions{
+				ManifestKey: manifestKey, RetainBlocks: 1, EvidenceMaxAgeBlocks: 1, EvidenceMaxAgeDuration: time.Nanosecond,
+			}, time.Hour, stats)
+			deadline := time.After(2 * time.Second)
+			for stats.snapshot()[liveMetricPruneErrors] == int64(0) {
+				select {
+				case err := <-errCh:
+					t.Fatalf("maintenance exited: %v", err)
+				case <-deadline:
+					t.Fatal("unsafe archive did not produce a prune error")
+				default:
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if err := ingestor.WithHotStore(func(bs *store.BlockStore) error {
+				if bs.Base() != 1 {
+					t.Fatalf("base changed: %d", bs.Base())
+				}
+				for h := int64(1); h <= 5; h++ {
+					if bs.LoadBlock(h) == nil {
+						t.Fatalf("hot block %d was deleted", h)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestLiveIngestorMaintenanceLoopArchivesThenPrunes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1221,7 +1410,7 @@ func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringArchiveUpload(t *tes
 
 	submitted := make(chan error, 1)
 	go func() {
-		_, submitErr := ingestor.Submit(makeCLITestBlock(6))
+		_, submitErr := ingestor.Submit(makeCLITestSuccessor(t, ingestor.LoadBlock(5)))
 		submitted <- submitErr
 	}()
 	select {
@@ -1246,6 +1435,94 @@ func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringArchiveUpload(t *tes
 			t.Fatalf("maintenance loop failed after segment upload released: %v", loopErr)
 		case <-deadline:
 			t.Fatalf("archive did not finish after release; last verify error: %v", verifyErr)
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func TestLiveIngestorMaintenanceLoopDoesNotBlockIngestDuringPruneVerify(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dbDir := filepath.Join(t.TempDir(), "db")
+	createCLIBlockStoreFixture(t, dbDir, 5)
+	reader, err := archive.OpenCometBlockStore(dbDir, "goleveldb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	ingestor, err := blocksyncarchive.NewHotIngestor(reader, blocksyncarchive.IngestOptions{ChainID: cliTestChainID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localStore, err := archive.NewLocalObjectStore(filepath.Join(t.TempDir(), "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived, err := archive.ArchiveReady(ctx, reader, localStore, archive.LiveArchiveOptions{
+		ChainID:       cliTestChainID,
+		Prefix:        "archive",
+		ReadyHeight:   4,
+		SegmentBlocks: 2,
+		Compression:   archive.CompressionGzip,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectStore := &blockingSegmentGetStore{
+		ObjectStore: localStore,
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(objectStore.release)
+		}
+	}()
+	errCh := startLiveIngestorMaintenanceLoop(ctx, ingestor, objectStore, archive.LiveArchiveOptions{
+		ChainID:       cliTestChainID,
+		Prefix:        "archive",
+		SegmentBlocks: 2,
+		Compression:   archive.CompressionGzip,
+	}, 1, time.Hour, archive.PruneHotOptions{
+		ManifestKey:            archived.ManifestKey,
+		RetainBlocks:           1,
+		EvidenceMaxAgeBlocks:   1,
+		EvidenceMaxAgeDuration: time.Nanosecond,
+	}, time.Hour, newLiveMaintenanceStats())
+
+	select {
+	case <-objectStore.started:
+	case loopErr := <-errCh:
+		t.Fatalf("maintenance loop failed before verify read blocked: %v", loopErr)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for prune verification read to block")
+	}
+
+	submitted := make(chan error, 1)
+	go func() {
+		_, submitErr := ingestor.Submit(makeCLITestSuccessor(t, ingestor.LoadBlock(5)))
+		submitted <- submitErr
+	}()
+	select {
+	case submitErr := <-submitted:
+		if submitErr != nil {
+			t.Fatalf("submit while prune verification blocked: %v", submitErr)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("ingest submit blocked behind object-store prune verification")
+	}
+	close(objectStore.release)
+	released = true
+
+	deadline := time.After(500 * time.Millisecond)
+	for reader.Base() != 5 {
+		select {
+		case loopErr := <-errCh:
+			t.Fatalf("maintenance loop failed after verify released: %v", loopErr)
+		case <-deadline:
+			t.Fatalf("base after prune = %d, want 5", reader.Base())
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -1997,6 +2274,26 @@ func (s *blockingSegmentStore) blockSegmentPut(ctx context.Context, key string) 
 	}
 }
 
+// blockingSegmentGetStore blocks the first segment read until released.
+type blockingSegmentGetStore struct {
+	archive.ObjectStore
+	started chan struct{}
+	release chan struct{}
+	blocked atomic.Bool
+}
+
+func (s *blockingSegmentGetStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if strings.Contains(key, "/segments/") && s.blocked.CompareAndSwap(false, true) {
+		close(s.started)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.ObjectStore.Get(ctx, key)
+}
+
 func createCLIBlockStoreFixture(t *testing.T, dir string, heights int) {
 	t.Helper()
 	db, err := dbm.NewDB("blockstore", dbm.BackendType("goleveldb"), dir)
@@ -2014,6 +2311,19 @@ func createCLIBlockStoreFixture(t *testing.T, dir string, heights int) {
 		seen := &ctypes.Commit{Height: h, Signatures: []ctypes.CommitSig{}}
 		bs.SaveBlock(block, parts, seen)
 	}
+}
+
+func makeCLITestSuccessor(t *testing.T, previous *ctypes.Block) *ctypes.Block {
+	t.Helper()
+	parts, err := previous.MakePartSet(ctypes.BlockPartSizeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := makeCLITestBlock(previous.Height + 1)
+	block.LastBlockID = ctypes.BlockID{Hash: previous.Hash(), PartSetHeader: parts.Header()}
+	block.LastCommit = &ctypes.Commit{Height: previous.Height, BlockID: block.LastBlockID}
+	block.LastCommitHash = block.LastCommit.Hash()
+	return block
 }
 
 func makeCLITestBlock(height int64) *ctypes.Block {
@@ -2039,4 +2349,35 @@ func testBytes(value byte, size int) []byte {
 		bz[i] = value
 	}
 	return bz
+}
+
+func TestServeP2PRateValidation(t *testing.T) {
+	for _, name := range []string{"send", "recv"} {
+		for _, value := range []string{"0", "-1", "9223372036854775808"} {
+			t.Run(name+value, func(t *testing.T) {
+				dir := t.TempDir()
+				storeURL := "file://" + filepath.Join(dir, "objects")
+				args := []string{"serve", "--store", storeURL, "--chain-id", cliTestChainID}
+				out := executeErr(t, append(args, "--p2p-"+name+"-rate="+value)...)
+				if !strings.Contains(out, "must be positive") && !strings.Contains(out, "value out of range") {
+					t.Fatalf("unexpected flag error: %s", out)
+				}
+				path := filepath.Join(dir, "serve.json")
+				cfg := fmt.Sprintf(`{"p2p_%s_rate": %s}`, name, value)
+				if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				out = executeErr(t, append(args, "--config", path)...)
+				if !strings.Contains(out, "must be positive") && !strings.Contains(out, "cannot unmarshal number") {
+					t.Fatalf("unexpected JSON error: %s", out)
+				}
+			})
+		}
+	}
+	out := execute(t, "serve", "--store", "file://"+filepath.Join(t.TempDir(), "objects"), "--chain-id", cliTestChainID)
+	for _, want := range []string{`"p2p_send_rate": 5120000`, `"p2p_recv_rate": 5120000`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing default %s: %s", want, out)
+		}
+	}
 }

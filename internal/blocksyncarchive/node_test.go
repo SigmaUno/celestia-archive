@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1592,4 +1593,35 @@ func (n *stockBlocksyncP2PNode) Stop() error {
 		stopErr = err
 	}
 	return stopErr
+}
+
+func TestArchiveNodeTransportRates(t *testing.T) {
+	ingestor, err := NewHotIngestor(newTestBlockStore(t), IngestOptions{ChainID: ingestTestChainID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rates := range [][2]int64{{0, 0}, {1_000_000, 9_000_000}, {-1, 1}, {1, -1}} {
+		t.Run(fmt.Sprint(rates), func(t *testing.T) {
+			node, err := NewArchiveNode(ingestor, nil, NodeOptions{ChainID: ingestTestChainID, SendRate: rates[0], RecvRate: rates[1]})
+			if rates[0] < 0 || rates[1] < 0 {
+				if err == nil {
+					t.Fatal("negative rate accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := rates
+			for n := range want {
+				if want[n] == 0 {
+					want[n] = 5_120_000
+				}
+			}
+			transportConfig := reflect.ValueOf(node.Transport).Elem().FieldByName("mConfig")
+			if node.Config.SendRate != want[0] || node.Config.RecvRate != want[1] || transportConfig.FieldByName("SendRate").Int() != want[0] || transportConfig.FieldByName("RecvRate").Int() != want[1] {
+				t.Fatalf("transport rates differ from requested %v", want)
+			}
+		})
+	}
 }

@@ -15,6 +15,8 @@ var (
 
 type PeerID string
 
+const MaxInflightPerPeer = 32
+
 type PeerRange struct {
 	Base   int64
 	Height int64
@@ -37,16 +39,21 @@ type Request struct {
 }
 
 type RequestPlanner struct {
-	peers    map[PeerID]PeerRange
-	inflight map[int64]inflightRequest
-	received map[int64]struct{}
-	noBlocks map[PeerID]map[int64]struct{}
-	timeouts map[PeerID]map[int64]struct{}
+	peers          map[PeerID]PeerRange
+	inflight       map[int64]inflightRequest
+	received       map[int64]struct{}
+	noBlocks       map[PeerID]map[int64]struct{}
+	timeouts       map[PeerID]map[int64]struct{}
+	rejected       map[PeerID]map[int64]struct{}
+	recoveryHeight int64
+	recoveryPeer   PeerID
+	recoveryTried  map[PeerID]bool
 }
 
 type inflightRequest struct {
 	PeerID      PeerID
 	RequestedAt time.Time
+	LocalRetry  bool
 }
 
 func NewRequestPlanner() *RequestPlanner {
@@ -56,6 +63,7 @@ func NewRequestPlanner() *RequestPlanner {
 		received: make(map[int64]struct{}),
 		noBlocks: make(map[PeerID]map[int64]struct{}),
 		timeouts: make(map[PeerID]map[int64]struct{}),
+		rejected: make(map[PeerID]map[int64]struct{}),
 	}
 }
 
@@ -100,6 +108,53 @@ func (p *RequestPlanner) MarkFailed(height int64) {
 	delete(p.received, height)
 }
 
+func (p *RequestPlanner) RejectAt(id PeerID, height int64) {
+	if id == "" {
+		return
+	}
+	if p.rejected[id] == nil {
+		p.rejected[id] = make(map[int64]struct{})
+	}
+	p.rejected[id][height] = struct{}{}
+}
+
+func (p *RequestPlanner) RetryLater(id PeerID, height int64) {
+	p.MarkFailed(height)
+	p.inflight[height] = inflightRequest{PeerID: id, RequestedAt: time.Now(), LocalRetry: true}
+}
+
+// simplify: recovery needs one provider for both heights; cross-provider recovery requires independent fork evidence.
+func (p *RequestPlanner) RecoverPair(height int64) {
+	if p.recoveryHeight != height {
+		p.recoveryTried = make(map[PeerID]bool)
+	}
+	p.recoveryHeight, p.recoveryPeer = height, ""
+	for h := range p.inflight {
+		if h >= height {
+			delete(p.inflight, h)
+		}
+	}
+	for h := range p.received {
+		if h >= height {
+			delete(p.received, h)
+		}
+	}
+}
+
+func (p *RequestPlanner) recoveryFailed(id PeerID) bool {
+	h := p.recoveryHeight
+	r := p.peers[id]
+	for _, height := range []int64{h, h + 1} {
+		if !r.Contains(height) || p.peerReturnedNoBlock(id, height) || p.peerTimedOut(id, height) {
+			return true
+		}
+		if _, rejected := p.rejected[id][height]; rejected {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *RequestPlanner) MarkReceived(height int64) {
 	delete(p.inflight, height)
 	if height > 0 {
@@ -132,6 +187,10 @@ func (p *RequestPlanner) ExpireInflight(now time.Time, timeout time.Duration) in
 			continue
 		}
 		delete(p.inflight, height)
+		if inflight.LocalRetry {
+			expired++
+			continue
+		}
 		if p.timeouts[inflight.PeerID] == nil {
 			p.timeouts[inflight.PeerID] = make(map[int64]struct{})
 		}
@@ -172,6 +231,13 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 		return nil, errors.New("next height must be positive")
 	}
 	p.pruneMarkersBelow(nextHeight)
+	// Pending height may be refetched until its successor persists it.
+	for id, heights := range p.rejected {
+		pruneHeightSet(heights, nextHeight-1)
+		if len(heights) == 0 {
+			delete(p.rejected, id)
+		}
+	}
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -181,12 +247,41 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 	if len(p.peers) == 0 {
 		return nil, ErrNoPeers
 	}
+	if p.recoveryHeight > 0 && nextHeight > p.recoveryHeight+1 {
+		p.recoveryHeight, p.recoveryPeer, p.recoveryTried = 0, "", nil
+	}
+	if p.recoveryHeight > 0 && p.recoveryPeer == "" {
+		ids := make([]PeerID, 0, len(p.peers))
+		for id := range p.peers {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		for _, id := range ids {
+			if !p.recoveryTried[id] && !p.recoveryFailed(id) {
+				p.recoveryPeer = id
+				p.recoveryTried[id] = true
+				break
+			}
+		}
+		if p.recoveryPeer == "" {
+			return nil, ErrNoPeerForHeight
+		}
+	}
 	best := p.BestHeight()
+	if p.recoveryHeight > 0 {
+		best = p.recoveryHeight + 1
+	}
 	if best < nextHeight {
 		return nil, nil
 	}
 
 	requests := make([]Request, 0, limit)
+	loads := make(map[PeerID]int, len(p.peers))
+	for _, request := range p.inflight {
+		if !request.LocalRetry {
+			loads[request.PeerID]++
+		}
+	}
 	windowEnd := nextHeight + int64(limit) - 1
 	if windowEnd < nextHeight {
 		windowEnd = best
@@ -198,14 +293,21 @@ func (p *RequestPlanner) PlanAt(nextHeight int64, limit int, now time.Time) ([]R
 		if _, exists := p.received[height]; exists {
 			continue
 		}
-		peerID, ok := p.peerForHeight(height)
+		peerID, ok := p.recoveryPeer, p.recoveryPeer != ""
+		if !ok {
+			peerID, ok = p.peerForHeight(height, loads)
+		}
 		if !ok {
 			if len(requests) == 0 {
 				return nil, fmt.Errorf("%w: %d", ErrNoPeerForHeight, height)
 			}
 			return requests, nil
 		}
+		if p.recoveryPeer == "" && loads[peerID] >= MaxInflightPerPeer {
+			return requests, nil
+		}
 		p.inflight[height] = inflightRequest{PeerID: peerID, RequestedAt: now}
+		loads[peerID]++
 		requests = append(requests, Request{PeerID: peerID, Height: height})
 	}
 	return requests, nil
@@ -239,22 +341,22 @@ func pruneHeightSet(heights map[int64]struct{}, below int64) {
 	}
 }
 
-func (p *RequestPlanner) peerForHeight(height int64) (PeerID, bool) {
-	ids := make([]string, 0, len(p.peers))
-	for id := range p.peers {
-		ids = append(ids, string(id))
-	}
-	slices.Sort(ids)
-	for _, id := range ids {
-		peerID := PeerID(id)
-		if p.peers[peerID].Contains(height) && !p.peerReturnedNoBlock(peerID, height) && !p.peerTimedOut(peerID, height) {
-			return peerID, true
+func (p *RequestPlanner) peerForHeight(height int64, loads map[PeerID]int) (PeerID, bool) {
+	for _, allowTimeout := range []bool{false, true} {
+		var best PeerID
+		for id, advertised := range p.peers {
+			if _, rejected := p.rejected[id][height]; rejected {
+				continue
+			}
+			if !advertised.Contains(height) || p.peerReturnedNoBlock(id, height) || (!allowTimeout && p.peerTimedOut(id, height)) {
+				continue
+			}
+			if best == "" || loads[id] < loads[best] || (loads[id] == loads[best] && id < best) {
+				best = id
+			}
 		}
-	}
-	for _, id := range ids {
-		peerID := PeerID(id)
-		if p.peers[peerID].Contains(height) && !p.peerReturnedNoBlock(peerID, height) {
-			return peerID, true
+		if best != "" {
+			return best, true
 		}
 	}
 	return "", false

@@ -5,6 +5,8 @@
   "manifest_name": "manifest.json",
   "db_dir": "/var/lib/cometbft-archive/data",
   "db_backend": "goleveldb",
+  "p2p_send_rate": 5120000,
+  "p2p_recv_rate": 5120000,
   "p2p_listen": "tcp://0.0.0.0:26656",
   "moniker": "cometbft-archive-1",
   "node_key_file": "/var/lib/cometbft-archive/config/node_key.json",

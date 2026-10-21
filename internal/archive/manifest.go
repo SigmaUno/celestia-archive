@@ -124,6 +124,28 @@ func LoadManifest(ctx context.Context, store ObjectStore, key string) (Manifest,
 	return manifest, manifest.Validate()
 }
 
+// Archive progress and pruning authority require durable publication, even
+// when a failed manifest write left a complete, readable file behind.
+func loadDurableManifest(ctx context.Context, store ObjectStore, key string) (Manifest, error) {
+	manifest, err := LoadManifest(ctx, store, key)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if readOnly, ok := store.(readOnlyObjectStore); ok {
+		store = readOnly.store
+	}
+	if local, ok := store.(*LocalObjectStore); ok {
+		exists, err := local.Exists(ctx, key)
+		if err != nil {
+			return Manifest{}, err
+		}
+		if !exists {
+			return Manifest{}, ErrObjectNotFound
+		}
+	}
+	return manifest, nil
+}
+
 func SaveManifest(ctx context.Context, store ObjectStore, key string, manifest Manifest) error {
 	if err := ValidateObjectKey(key); err != nil {
 		return fmt.Errorf("manifest key: %w", err)

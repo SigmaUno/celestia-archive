@@ -19,6 +19,7 @@ import (
 	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	cmtstore "github.com/cometbft/cometbft/store"
+	"github.com/cometbft/cometbft/types"
 	"github.com/spf13/cobra"
 
 	"github.com/01builders/cometbft-archive/internal/archive"
@@ -475,7 +476,7 @@ func newServeCommand() (*cobra.Command, error) {
 	var configPath string
 	var validationMode, validatorSetRPC string
 	var checkpointValues, validatorSetValues []string
-	var safetyWindow, retainBlocks, evidenceBlocks int64
+	var safetyWindow, retainBlocks, evidenceBlocks, p2pSendRate, p2pRecvRate int64
 	var archiveInterval, pruneInterval, evidenceDuration, requestTimeout, coldManifestCacheTTL, validatorSetTimeout time.Duration
 	var segmentBlocks, requestLimit, coldWorkers int
 	var statusRequestInterval time.Duration
@@ -489,6 +490,8 @@ func newServeCommand() (*cobra.Command, error) {
 				dbDir:                &dbDir,
 				dbBackend:            &backend,
 				listenAddress:        &listenAddress,
+				p2pSendRate:          &p2pSendRate,
+				p2pRecvRate:          &p2pRecvRate,
 				moniker:              &moniker,
 				nodeKeyFile:          &nodeKeyFile,
 				persistentPeers:      &persistentPeers,
@@ -538,6 +541,8 @@ func newServeCommand() (*cobra.Command, error) {
 				return errors.New("PEX requires at least one seed or an address book file")
 			}
 			if err := validateServeRuntimeConfig(serveRuntimeConfig{
+				p2pSendRate:           p2pSendRate,
+				p2pRecvRate:           p2pRecvRate,
 				requestLimit:          requestLimit,
 				coldWorkers:           coldWorkers,
 				coldManifestCacheTTL:  coldManifestCacheTTL,
@@ -604,9 +609,20 @@ func newServeCommand() (*cobra.Command, error) {
 					}
 					validatorSetSource = source
 				}
+				coldSource, err := blocksyncarchive.NewArchiveBlockSource(store, key)
+				if err != nil {
+					return err
+				}
+				if ttlErr := coldSource.SetManifestCacheTTL(coldManifestCacheTTL); ttlErr != nil {
+					return ttlErr
+				}
+				predecessor, err := liveIngestPredecessor(cmd.Context(), blockStore, summary, coldSource, flags.chainID)
+				if err != nil {
+					return err
+				}
 				ingestor, err := blocksyncarchive.NewHotIngestor(blockStore, blocksyncarchive.IngestOptions{
 					ChainID:            flags.chainID,
-					StartHeight:        liveIngestStartHeight(blockStore, summary),
+					Predecessor:        predecessor,
 					SafetyWindow:       safetyWindow,
 					Validation:         blocksyncarchive.ValidationMode(validationMode),
 					Checkpoints:        checkpoints,
@@ -616,13 +632,7 @@ func newServeCommand() (*cobra.Command, error) {
 				if err != nil {
 					return err
 				}
-				coldSource, err := blocksyncarchive.NewArchiveBlockSource(store, key)
-				if err != nil {
-					return err
-				}
-				if ttlErr := coldSource.SetManifestCacheTTL(coldManifestCacheTTL); ttlErr != nil {
-					return ttlErr
-				}
+
 				nodeLogger, err := cmtflags.ParseLogLevel(logLevel, cmtlog.NewTMLogger(cmtlog.NewSyncWriter(cmd.ErrOrStderr())), "info")
 				if err != nil {
 					return fmt.Errorf("log-level: %w", err)
@@ -630,6 +640,8 @@ func newServeCommand() (*cobra.Command, error) {
 				node, err := blocksyncarchive.NewArchiveNode(ingestor, nil, blocksyncarchive.NodeOptions{
 					ChainID:         flags.chainID,
 					ListenAddress:   listenAddress,
+					SendRate:        p2pSendRate,
+					RecvRate:        p2pRecvRate,
 					Moniker:         moniker,
 					NodeKeyFile:     nodeKeyFile,
 					PersistentPeers: splitCSV(persistentPeers),
@@ -721,6 +733,8 @@ func newServeCommand() (*cobra.Command, error) {
 					"pex":                     pexEnabled,
 					"addr_book_file":          addrBookFile,
 					"seeds":                   splitCSV(seeds),
+					"p2p_send_rate":           p2pSendRate,
+					"p2p_recv_rate":           p2pRecvRate,
 					"request_limit":           requestLimit,
 					"cold_workers":            resolvedColdWorkers(requestLimit, coldWorkers),
 					"cold_manifest_cache_ttl": coldManifestCacheTTL.String(),
@@ -762,6 +776,8 @@ func newServeCommand() (*cobra.Command, error) {
 				"pex":                     pexEnabled,
 				"addr_book_file":          addrBookFile,
 				"seeds":                   splitCSV(seeds),
+				"p2p_send_rate":           p2pSendRate,
+				"p2p_recv_rate":           p2pRecvRate,
 				"request_limit":           requestLimit,
 				"cold_workers":            resolvedColdWorkers(requestLimit, coldWorkers),
 				"cold_manifest_cache_ttl": coldManifestCacheTTL.String(),
@@ -793,6 +809,8 @@ func newServeCommand() (*cobra.Command, error) {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "Describe the live archive node without starting P2P")
 	cmd.Flags().StringVar(&dbDir, "db-dir", "", "CometBFT DB directory containing blockstore.db")
 	cmd.Flags().StringVar(&backend, "db-backend", "goleveldb", "CometBFT DB backend")
+	cmd.Flags().Int64Var(&p2pSendRate, "p2p-send-rate", blocksyncarchive.DefaultP2PRate, "Per-peer P2P send rate in bytes/second (positive)")
+	cmd.Flags().Int64Var(&p2pRecvRate, "p2p-recv-rate", blocksyncarchive.DefaultP2PRate, "Per-peer P2P receive rate in bytes/second (positive)")
 	cmd.Flags().StringVar(&listenAddress, "p2p-listen", "tcp://0.0.0.0:26656", "P2P listen address")
 	cmd.Flags().StringVar(&moniker, "moniker", "cometbft-archive", "P2P node moniker advertised in node info")
 	cmd.Flags().StringVar(&nodeKeyFile, "node-key-file", "", "Path to node_key.json; required when dry-run=false")
@@ -861,11 +879,21 @@ type blockStoreHeightReader interface {
 	Height() int64
 }
 
-func liveIngestStartHeight(blockStore blockStoreHeightReader, summary archive.InspectSummary) int64 {
-	if blockStore != nil && blockStore.Height() == 0 && summary.LastHeight > 0 {
-		return summary.LastHeight + 1
+func liveIngestPredecessor(ctx context.Context, blockStore blockStoreHeightReader, summary archive.InspectSummary, source blocksyncarchive.ColdBlockSource, chainID string) (*types.Block, error) {
+	if blockStore.Height() > 0 || summary.LastHeight == 0 {
+		return nil, nil
 	}
-	return 0
+	if summary.ChainID != chainID {
+		return nil, fmt.Errorf("archive chain ID %q, expected %q", summary.ChainID, chainID)
+	}
+	tip, err := source.LoadBlock(ctx, summary.LastHeight)
+	if err != nil {
+		return nil, fmt.Errorf("load archive predecessor %d: %w", summary.LastHeight, err)
+	}
+	if tip == nil || tip.Height != summary.LastHeight || tip.ChainID != chainID {
+		return nil, errors.New("archive predecessor height or chain ID mismatch")
+	}
+	return tip, nil
 }
 
 func markRequired(cmd *cobra.Command, names ...string) error {
@@ -944,6 +972,7 @@ func startLiveIngestorMaintenanceLoop(
 		archiveInterval = 30 * time.Second
 	}
 	lastPrune := time.Time{}
+	var verifiedSnapshot *archive.VerifiedArchive
 	runMaintenance := func() bool {
 		archived, archiveErr := archive.ArchiveReadyFromHead(ctx, ingestor.BlockReader(), objectStore, archiveOpts, safetyWindow)
 		if archiveErr != nil {
@@ -957,10 +986,27 @@ func startLiveIngestorMaintenanceLoop(
 		if pruneInterval <= 0 || (!lastPrune.IsZero() && time.Since(lastPrune) < pruneInterval) {
 			return true
 		}
+		// Verify object storage before taking the exclusive hot store lock so
+		// slow remote reads never stall block ingestion.
+		verified, verifyErr := verifyLiveArchive(ctx, objectStore, pruneOpts, verifiedSnapshot)
+		if verifyErr != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+			verifiedSnapshot = nil
+			stats.recordPrune(0, verifyErr)
+			return true
+		}
+		verifiedSnapshot = verified
+		if verified == nil {
+			stats.recordPrune(0, nil)
+			lastPrune = time.Now()
+			return true
+		}
 		var pruned archive.PruneHotResult
 		pruneErr := ingestor.WithHotStore(func(blockStore *cmtstore.BlockStore) error {
 			var err error
-			pruned, err = runLivePrune(ctx, blockStore, objectStore, pruneOpts)
+			pruned, err = archive.PruneHotStoreThrough(blockStore, pruneOpts, verified)
 			return err
 		})
 		if pruneErr != nil {
@@ -978,23 +1024,18 @@ func startLiveIngestorMaintenanceLoop(
 	return errCh
 }
 
-func runLivePrune(
+// verifyLiveArchive returns nil when nothing is archived yet.
+func verifyLiveArchive(
 	ctx context.Context,
-	blockStore *cmtstore.BlockStore,
 	objectStore archive.ObjectStore,
 	opts archive.PruneHotOptions,
-) (archive.PruneHotResult, error) {
-	manifest, err := archive.LoadManifest(ctx, objectStore, opts.ManifestKey)
+	previous *archive.VerifiedArchive,
+) (*archive.VerifiedArchive, error) {
+	verified, err := archive.VerifyArchiveForPrune(ctx, objectStore, opts.ManifestKey, previous)
 	if errors.Is(err, archive.ErrObjectNotFound) {
-		return archive.PruneHotResult{}, nil
+		return nil, nil //nolint:nilnil // No archive means no pruning authority.
 	}
-	if err != nil {
-		return archive.PruneHotResult{}, err
-	}
-	if manifest.LastHeight == 0 {
-		return archive.PruneHotResult{}, nil
-	}
-	return archive.PruneVerifiedHotStore(ctx, blockStore, objectStore, opts)
+	return verified, err
 }
 
 func archiveRange(summary archive.InspectSummary) string {
@@ -1101,6 +1142,8 @@ func validationTrustModel(validationMode string, checkpointValues, validatorSetV
 }
 
 type serveRuntimeConfig struct {
+	p2pSendRate           int64
+	p2pRecvRate           int64
 	requestLimit          int
 	coldWorkers           int
 	coldManifestCacheTTL  time.Duration
@@ -1117,6 +1160,9 @@ type serveRuntimeConfig struct {
 }
 
 func validateServeRuntimeConfig(c serveRuntimeConfig) error {
+	if c.p2pSendRate <= 0 || c.p2pRecvRate <= 0 {
+		return errors.New("P2P send and receive rates must be positive")
+	}
 	if c.requestLimit <= 0 {
 		return errors.New("request limit must be positive")
 	}

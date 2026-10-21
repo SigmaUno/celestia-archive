@@ -5,9 +5,102 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestLocalObjectStorePublicationSync(t *testing.T) {
+	for _, immutable := range []bool{false, true} {
+		name := "put"
+		if immutable {
+			name = "put-if-absent"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, failAt := range []string{"", "publication", "root", "ancestor"} {
+				t.Run("failure="+failAt, func(t *testing.T) {
+					base := t.TempDir()
+					root := filepath.Join(base, "new", "archive")
+					store, err := NewLocalObjectStore(root)
+					if err != nil {
+						t.Fatal(err)
+					}
+					key := "chains/test/segments/1.cba"
+					path := filepath.Join(root, filepath.FromSlash(key))
+					dir := filepath.Dir(path)
+					failureDir := map[string]string{"publication": dir, "root": root, "ancestor": base}[failAt]
+					injected := errors.New("directory sync failed")
+					originalSync := syncLocalDirectory
+					t.Cleanup(func() { syncLocalDirectory = originalSync })
+					var synced []string
+					syncLocalDirectory = func(dir string) error {
+						data, err := os.ReadFile(path)
+						if err != nil || string(data) != "segment" {
+							t.Fatalf("object at directory sync = %q, %v", data, err)
+						}
+						synced = append(synced, dir)
+						if dir == failureDir {
+							return injected
+						}
+						return originalSync(dir)
+					}
+					put := store.Put
+					if immutable {
+						put = store.PutIfAbsent
+					}
+					err = put(context.Background(), key, []byte("segment"))
+					if failureDir != "" {
+						if !errors.Is(err, injected) || !strings.Contains(err.Error(), failureDir) {
+							t.Fatalf("publication error = %v, want directory sync error for %s", err, failureDir)
+						}
+					} else if err != nil {
+						t.Fatal(err)
+					}
+					var want []string
+					for {
+						want = append(want, dir)
+						parent := filepath.Dir(dir)
+						if dir == failureDir || dir == parent {
+							break
+						}
+						dir = parent
+					}
+					if !slices.Equal(synced, want) {
+						t.Fatalf("synced directories = %v, want %v", synced, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLocalObjectStorePutReplacesAtomically(t *testing.T) {
+	store, err := NewLocalObjectStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "manifests/manifest.json"
+	if err := store.Put(ctx, key, []byte("old manifest")); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.Open(filepath.Join(store.root, filepath.FromSlash(key)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if err := store.Put(ctx, key, []byte("new manifest")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, key)
+	if err != nil || string(got) != "new manifest" {
+		t.Fatalf("published manifest = %q, %v", got, err)
+	}
+	data := make([]byte, len("old manifest"))
+	if _, err := old.Read(data); err != nil || string(data) != "old manifest" {
+		t.Fatalf("open previous manifest = %q, %v", data, err)
+	}
+}
 
 func TestLocalObjectStorePutIfAbsentDoesNotOverwrite(t *testing.T) {
 	store, err := NewLocalObjectStore(t.TempDir())
